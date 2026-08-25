@@ -592,11 +592,7 @@ def run_recommend_heavy_once(
         model_fingerprint = f"{VECTOR_SYNC_ALGORITHM}:{model}:{dim}"
     # open_skill_vector_index：无 pymilvus 时退回内存索引并 hourly warn
     index = memory_index or open_skill_vector_index(vdb, dim=dim)
-    # sweep_key 只取 算法:模型:维度 这部分，不拼索引实例标识——见
-    # run_vector_sync 的 sweep_key 说明：没有持久索引时每个子进程的
-    # index 对象都是新的，若拿它的 id() 当播种去重键，会导致「已经
-    # 播种过」永远判定为假，多轮攒下的脏表进度被每轮重新播种抹掉。
-    sweep_key = model_fingerprint
+    stable_sweep_key = model_fingerprint
     model_fingerprint = (
         f"{model_fingerprint}:{_vector_index_identity(index, vdb)}"
     )
@@ -607,6 +603,11 @@ def run_recommend_heavy_once(
     ephemeral_index = memory_index is None and isinstance(
         index, MemorySkillVectorIndex,
     )
+    # 持久索引的 sweep 必须绑定文件 identity：同路径数据库在多轮 sweep
+    # 中途被替换后，要重新播种已经从旧索引队列中清掉的 key。只有每个
+    # 子进程都会得到全新对象的内存 fallback 使用稳定 key，否则 id(index)
+    # 每轮变化会反复播种并抹掉多轮消费进度。
+    sweep_key = stable_sweep_key if ephemeral_index else model_fingerprint
     vec_stats = run_vector_sync(
         db_path=registry,
         embed=embed_fn,

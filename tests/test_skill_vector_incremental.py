@@ -640,6 +640,65 @@ class TestSweepSeededMarkerReviewFindings:
         for i in range(5):
             assert embedded_with[f"d{i}"] == "C"
 
+    def test_persistent_index_replacement_mid_sweep_reseeds_everything(
+        self, registry_db, tmp_path, monkeypatch,
+    ):
+        """持久索引文件在多轮 sweep 中途被替换时，新索引必须重新播种。
+
+        模型算法和维度没有变化，只有数据库 inode 变化；旧逻辑使用不含
+        索引 identity 的稳定 sweep key，会让新索引只消费旧队列剩余项，
+        随后错误提交为已追平。
+        """
+        from xskill.recommend.heavy_worker import run_recommend_heavy_once
+
+        for i in range(5):
+            _store_catalog(
+                registry_db, _catalog_row(f"native:k{i}", f"d{i}"), mark=False,
+            )
+
+        class PersistentIndex:
+            def __init__(self, db_path):
+                self.db_path = db_path
+                self.inner = CountingIndex()
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+        vector_db = tmp_path / "vectors.db"
+        vector_db.write_bytes(b"old-index")
+        old_index = PersistentIndex(vector_db)
+        new_index = PersistentIndex(vector_db)
+        indexes = iter((old_index, new_index))
+        monkeypatch.setattr(
+            "xskill.recommend.skill_vector_store.open_skill_vector_index",
+            lambda *_args, **_kwargs: next(indexes),
+        )
+
+        first = run_recommend_heavy_once(
+            engine=SimpleNamespace(embed_client=None),
+            db_path=registry_db,
+            vector_db_path=vector_db,
+            vector_sync_batch_limit=2,
+            mark_catalog_dirty=False,
+        )
+        assert first["vector"]["remaining"] == 3
+        assert old_index.list_keys() == {"native:k0", "native:k1"}
+
+        replacement = tmp_path / "replacement.db"
+        replacement.write_bytes(b"new-index")
+        replacement.replace(vector_db)
+        second = run_recommend_heavy_once(
+            engine=SimpleNamespace(embed_client=None),
+            db_path=registry_db,
+            vector_db_path=vector_db,
+            vector_sync_batch_limit=10,
+            mark_catalog_dirty=False,
+        )
+
+        assert second["vector"]["remaining"] == 0
+        assert second["vector"]["upserted"] == 5
+        assert new_index.list_keys() == {f"native:k{i}" for i in range(5)}
+
     def test_sweep_marker_cleared_on_completion_allows_next_periodic_seed(
         self, registry_db,
     ):
