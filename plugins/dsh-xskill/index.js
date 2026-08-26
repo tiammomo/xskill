@@ -15,6 +15,7 @@ import {
   DEFAULT_RANK,
   PROVIDER_NAME,
   discoverSkills,
+  inspectSkillRoot,
   parseSkillDirFromConfig,
   resolveSkillRoot,
   searchSkills,
@@ -185,19 +186,7 @@ function registerTools(ctx, skillRootPromise) {
     },
     async execute() {
       const skillRoot = await skillRootPromise;
-      let exists = false;
-      let skillCount = 0;
-      try {
-        const skills = await discoverSkills(skillRoot);
-        exists = true;
-        skillCount = skills.length;
-      } catch (error) {
-        if (error && (error.code === "ENOENT" || error.code === "ENOTDIR")) {
-          exists = false;
-        } else {
-          throw error;
-        }
-      }
+      const { exists, skillCount } = await inspectSkillRoot(skillRoot);
       const cli = detectXskillCli();
       return {
         skillRoot,

@@ -5,6 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   discoverSkills,
+  inspectSkillRoot,
   isSkillName,
   parseFrontmatter,
   parseSkillDirFromConfig,
@@ -82,6 +83,22 @@ test("discoverSkills lists directory packages and skips junk", async () => {
   assert.equal(skills.length, 1);
   assert.equal(skills[0].name, "invoice-check");
   assert.match(skills[0].content, /Use the checker/);
+});
+
+test("inspectSkillRoot distinguishes a missing root from an empty root", async () => {
+  const base = await mkdtemp(join(tmpdir(), "dsh-xskill-status-"));
+  const missing = join(base, "missing");
+  const empty = join(base, "empty");
+  await mkdir(empty);
+
+  assert.deepEqual(await inspectSkillRoot(missing), {
+    exists: false,
+    skillCount: 0,
+  });
+  assert.deepEqual(await inspectSkillRoot(empty), {
+    exists: true,
+    skillCount: 0,
+  });
 });
 
 test("searchSkills matches name and body", async () => {

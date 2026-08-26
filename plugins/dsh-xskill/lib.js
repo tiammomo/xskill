@@ -210,6 +210,20 @@ export async function discoverSkills(skillRoot) {
   return skills;
 }
 
+export async function inspectSkillRoot(skillRoot) {
+  try {
+    const info = await stat(skillRoot);
+    if (!info.isDirectory()) return { exists: false, skillCount: 0 };
+  } catch (error) {
+    if (error && (error.code === "ENOENT" || error.code === "ENOTDIR")) {
+      return { exists: false, skillCount: 0 };
+    }
+    throw error;
+  }
+  const skills = await discoverSkills(skillRoot);
+  return { exists: true, skillCount: skills.length };
+}
+
 export function searchSkills(skills, query, limit = 20) {
   const needle = String(query || "").trim().toLowerCase();
   const cap = Number.isInteger(limit) && limit > 0 ? limit : 20;
