@@ -48,6 +48,14 @@ def _secret_scrub(text: str) -> str:
     return text
 
 
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
 def _session_roots() -> list[Path]:
     from xskill.agents.agent_tools import (
         _is_blocked_read_path,
@@ -58,11 +66,18 @@ def _session_roots() -> list[Path]:
     roots: list[Path] = []
     seen: set[str] = set()
     skip: set[str] = set()
-    if ctx.wiki_root is not None:
+    for excluded in (
+        ctx.wiki_root,
+        ctx.skill_dir,
+        ctx.atom_skill_dir,
+        ctx.spill_root,
+    ):
+        if excluded is None:
+            continue
         try:
-            skip.add(str(Path(ctx.wiki_root).resolve()))
+            skip.add(str(Path(excluded).resolve()))
         except OSError:
-            skip.add(str(Path(ctx.wiki_root)))
+            skip.add(str(Path(excluded)))
     candidates: list[Path] = []
     if ctx.default_traj_root is not None:
         candidates.append(Path(ctx.default_traj_root))
@@ -88,6 +103,10 @@ def _iter_traj_files(roots: list[Path]) -> list[Path]:
     for root in roots:
         if not root.exists():
             continue
+        try:
+            resolved_root = root.resolve()
+        except OSError:
+            resolved_root = root
         candidates: list[Path] = []
         if root.is_file():
             candidates.append(root)
@@ -110,7 +129,11 @@ def _iter_traj_files(roots: list[Path]) -> list[Path]:
             except OSError:
                 resolved = path
             key = str(resolved)
-            if key in seen or _is_blocked_read_path(resolved):
+            if (
+                key in seen
+                or not _is_relative_to(resolved, resolved_root)
+                or _is_blocked_read_path(resolved)
+            ):
                 continue
             seen.add(key)
             found.append(resolved)
@@ -253,9 +276,18 @@ def _peek_json_meta(path: Path) -> dict[str, Any]:
         return item
     if not isinstance(obj, dict):
         return item
-    item["source"] = str(obj.get("source") or obj.get("category") or "json")
+    item["source"] = _one_line(
+        _secret_scrub(str(obj.get("source") or obj.get("category") or "json")),
+        _PARAM_SNIP,
+    )
     item["query"] = _one_line(_secret_scrub(str(obj.get("query") or "")), _QUERY_SNIP)
-    tools = [str(x) for x in (obj.get("tool_names") or []) if x]
+    raw_tools = obj.get("tool_names")
+    if isinstance(raw_tools, list):
+        tools = [str(value) for value in raw_tools if isinstance(value, str) and value]
+    elif isinstance(raw_tools, str) and raw_tools:
+        tools = [raw_tools]
+    else:
+        tools = []
     timeline = obj.get("timeline") or []
     if not tools and isinstance(timeline, list):
         found: list[str] = []
@@ -268,7 +300,9 @@ def _peek_json_meta(path: Path) -> dict[str, Any]:
                 if isinstance(extra, dict) and extra.get("tool"):
                     found.append(str(extra.get("tool")))
         tools = list(dict.fromkeys(found))
-    item["tools"] = tools[:12]
+    item["tools"] = [
+        _one_line(_secret_scrub(value), _PARAM_SNIP) for value in tools[:12]
+    ]
     if not item["query"] and isinstance(timeline, list):
         for ev in timeline:
             if not isinstance(ev, dict):
@@ -335,7 +369,10 @@ def _listing_item(path: Path) -> dict[str, Any]:
     item["source"] = "markdown"
     for line in text.splitlines()[:40]:
         if line.startswith("source:"):
-            item["source"] = line.split(":", 1)[1].strip() or item["source"]
+            item["source"] = _one_line(
+                _secret_scrub(line.split(":", 1)[1].strip() or item["source"]),
+                _PARAM_SNIP,
+            )
     return item
 
 
@@ -371,26 +408,37 @@ def render_session_card(path: Path) -> str:
     text_out = "\n".join(body) + "\n"
     if len(text_out) > _CARD_CHAR_BUDGET:
         text_out = text_out[: _CARD_CHAR_BUDGET - 20] + "\n…[card truncated]\n"
-    return text_out
+    return _secret_scrub(text_out)
 
 
-def _find_by_id(traj_id: str) -> Path | None:
+def _session_index() -> dict[str, Path]:
+    return {path.stem: path for path in _iter_traj_files(_session_roots())}
+
+
+def _session_card_from_index(traj_id: str, index: dict[str, Path]) -> str:
     tid = (traj_id or "").strip()
     if not tid:
-        return None
-    for path in _iter_traj_files(_session_roots()):
-        if path.stem == tid:
-            return path
-    return None
+        return "error: traj_id 为空"
+    if "/" in tid or "\\" in tid or tid.endswith(".md") or tid.endswith(".json"):
+        return "error: traj_id 只要 id 本身，不要带路径或后缀"
+    path = index.get(tid)
+    if path is None:
+        return f"error: 找不到会话 {tid}。先 list_sessions。"
+    return f"traj_id={tid}\n\n{render_session_card(path)}"
 
 
 @tool(name="list_sessions")
 def list_sessions(offset: int = 0, limit: int = 60, query: str = "") -> str:
     """列出会话目录：id、来源、工具名、query 一行。这是扫面，不是正文，不算精读。"""
+    try:
+        start = max(0, int(offset))
+        take = max(1, min(int(limit), 80))
+    except (TypeError, ValueError):
+        return "error: offset/limit 必须是整数"
     files = _iter_traj_files(_session_roots())
-    items = [_listing_item(path) for path in files]
     needle = (query or "").strip().lower()
     if needle:
+        items = [_listing_item(path) for path in files]
         items = [
             item
             for item in items
@@ -403,14 +451,13 @@ def list_sessions(offset: int = 0, limit: int = 60, query: str = "") -> str:
                 ]
             ).lower()
         ]
-    try:
-        start = max(0, int(offset))
-        take = max(1, min(int(limit), 80))
-    except (TypeError, ValueError):
-        return "error: offset/limit 必须是整数"
-    page = items[start : start + take]
+        matched_count = len(items)
+        page = items[start : start + take]
+    else:
+        matched_count = len(files)
+        page = [_listing_item(path) for path in files[start : start + take]]
     lines = [
-        f"total={len(files)} matched={len(items)} showing={len(page)} offset={start}",
+        f"total={len(files)} matched={matched_count} showing={len(page)} offset={start}",
         "这是目录，不是正文。预览用 session_card / session_cards（一次最多 10 条）。",
     ]
     for item in page:
@@ -419,25 +466,17 @@ def list_sessions(offset: int = 0, limit: int = 60, query: str = "") -> str:
             f"{item.get('traj_id')}\tsource={item.get('source')}\t"
             f"tools={tools}\tquery={item.get('query')}"
         )
-    if start + take < len(items):
+    if start + take < matched_count:
         lines.append(
             f"continue: list_sessions(offset={start + take}, limit={take}, query={query!r})"
         )
-    return "\n".join(lines)
+    return _secret_scrub("\n".join(lines))
 
 
 @tool(name="session_card")
 def session_card(traj_id: str) -> str:
     """一条预览卡：query+行号、截断 toolcall、path。没有 tool result，不算精读。"""
-    tid = (traj_id or "").strip()
-    if not tid:
-        return "error: traj_id 为空"
-    if "/" in tid or "\\" in tid or tid.endswith(".md") or tid.endswith(".json"):
-        return "error: traj_id 只要 id 本身，不要带路径或后缀"
-    path = _find_by_id(tid)
-    if path is None:
-        return f"error: 找不到会话 {tid}。先 list_sessions。"
-    return f"traj_id={tid}\n\n{render_session_card(path)}"
+    return _session_card_from_index(traj_id, _session_index())
 
 
 @tool(name="session_cards")
@@ -449,5 +488,6 @@ def session_cards(traj_ids: str) -> str:
         return "error: traj_ids 为空"
     if len(ids) > 10:
         return f"error: 一次最多 10 条，这次给了 {len(ids)}。拆成多次。"
-    chunks = [session_card.entrypoint(traj_id=tid) for tid in ids]
+    index = _session_index()
+    chunks = [_session_card_from_index(tid, index) for tid in ids]
     return f"batch={len(ids)}\n\n" + "\n\n----\n\n".join(chunks)

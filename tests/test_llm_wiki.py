@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from xskill.agents import agent_tools, llm_wiki
 from xskill.team.server.generate_jobs import prepare_generate_wiki
 
@@ -61,12 +63,19 @@ def test_wiki_symlink_escape_blocked(tmp_path: Path):
     outside = tmp_path / "outside.md"
     outside.write_text("outside-secret\n", encoding="utf-8")
     link = wiki / "pages" / "leak.md"
-    link.symlink_to(outside)
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("当前平台不允许创建测试符号链接")
     ctx = _ctx(tmp_path, wiki)
     with agent_tools.use_agent_tool_context(ctx):
         denied = _call(llm_wiki.wiki_read, path="pages/leak.md")
+        status = _call(llm_wiki.wiki_status)
+        hits = _call(llm_wiki.wiki_search, pattern="outside-secret")
     assert denied.startswith("error:")
     assert "outside-secret" not in denied
+    assert "pages/leak.md" not in status
+    assert hits.startswith("(no hits for")
 
 
 def test_prepare_generate_wiki_does_not_overwrite(tmp_path: Path):
@@ -87,3 +96,22 @@ def test_after_compact_hint_mentions_plan(tmp_path: Path):
     before = len(messages)
     llm_wiki.apply_after_compact_hint(messages)
     assert len(messages) == before
+
+
+def test_wiki_log_appends_without_rereading_history(tmp_path: Path, monkeypatch):
+    wiki = llm_wiki.seed_generate_wiki(tmp_path / "wiki")
+    ctx = _ctx(tmp_path, wiki)
+    log = wiki / "log.md"
+    original_read_text = Path.read_text
+
+    def guarded_read_text(path, *args, **kwargs):
+        if path == log:
+            raise AssertionError("wiki_log must not reread the full log")
+        return original_read_text(path, *args, **kwargs)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(Path, "read_text", guarded_read_text)
+        with agent_tools.use_agent_tool_context(ctx):
+            result = _call(llm_wiki.wiki_log, entry="read traj_demo")
+    assert result.startswith("ok appended")
+    assert "read traj_demo" in log.read_text(encoding="utf-8")

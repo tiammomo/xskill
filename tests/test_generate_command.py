@@ -31,10 +31,13 @@ def _call_tool(tool, *args, **kwargs):
 def _bind_skill_ctx(tmp_path: Path, **extra):
     skill_dir = tmp_path / "skill"
     skill_dir.mkdir()
+    traj_root = Path(extra.get("default_traj_root") or (tmp_path / "trajs"))
+    traj_root.mkdir(parents=True, exist_ok=True)
     ctx = agent_tools.create_agent_tool_context(
         skill_dir=skill_dir,
         atom_skill_dir=skill_dir,
-        extra_read_roots=extra.get("extra_read_roots", (skill_dir,)),
+        default_traj_root=traj_root,
+        extra_read_roots=extra.get("extra_read_roots", (skill_dir, traj_root)),
         generate_user_id=extra.get("generate_user_id", "alice"),
         registry_db_path=extra.get("registry_db_path"),
     )
@@ -254,6 +257,28 @@ def test_commit_generate_main_requires_ten_traj_reads(tmp_path: Path):
             message="enough",
         )
     assert ok.startswith("committed to main: fresh-skill")
+
+
+def test_commit_gate_ignores_traj_named_files_outside_trajectory_roots(tmp_path: Path):
+    skill_dir, ctx = _bind_skill_ctx(tmp_path)
+    with agent_tools.use_agent_tool_context(ctx):
+        for index in range(10):
+            fake = skill_dir / f"traj_fake_{index}.md"
+            fake.write_text("not a trajectory\n", encoding="utf-8")
+            assert "not a trajectory" in _call_tool(agent_tools.read_file, str(fake))
+        assert agent_tools.generate_read_traj_ids() == []
+        assert agent_tools._generate_commit_read_gate() is not None
+
+
+def test_generate_does_not_block_skill_directory_named_sessions(tmp_path: Path):
+    skill_dir, ctx = _bind_skill_ctx(tmp_path)
+    sessions = skill_dir / "sessions"
+    sessions.mkdir()
+    (sessions / "notes.md").write_text("notes\n", encoding="utf-8")
+    with agent_tools.use_agent_tool_context(ctx):
+        listing = _call_tool(agent_tools.list_files, str(sessions))
+    assert not listing.startswith("error:")
+    assert "notes.md" in listing
 
 
 def test_session_card_does_not_count_as_traj_read(tmp_path: Path):

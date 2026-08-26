@@ -622,7 +622,6 @@ def _mark_file_read(path: Path) -> None:
 
 _TRAJ_STEM = re.compile(r"^traj_[A-Za-z0-9_-]+$")
 _MIN_GENERATE_TRAJ_READS = 10
-_SESSION_DIR_MARKERS = frozenset({"team_trajectories", "sessions"})
 
 
 def _is_generate_mode() -> bool:
@@ -632,10 +631,16 @@ def _is_generate_mode() -> bool:
 
 def generate_read_traj_ids() -> list[str]:
     """本趟 read_file 真正打开过的不同 traj_* stem。看过卡片的不算。"""
+    from xskill.agents.session_catalog import _session_roots
+
+    roots = _session_roots()
     ids: list[str] = []
     seen: set[str] = set()
     for raw in sorted(_read_file_ledger()):
-        name = Path(raw).name
+        path = Path(raw)
+        if not any(_is_relative_to(path, root) for root in roots):
+            continue
+        name = path.name
         if not (name.endswith(".md") or name.endswith(".json")):
             continue
         stem = Path(name).stem
@@ -670,23 +675,12 @@ def _is_generate_session_dir_scan(path: Path) -> bool:
         resolved = path
     if resolved.is_file():
         return False
-    if any(part in _SESSION_DIR_MARKERS for part in resolved.parts):
-        return True
-    ctx = current_agent_tool_context()
-    root = ctx.default_traj_root
-    if root is None:
-        return False
-    try:
-        traj = Path(root).resolve()
-    except OSError:
-        traj = Path(root)
-    if resolved == traj:
-        return True
-    try:
-        resolved.relative_to(traj)
-    except ValueError:
-        return False
-    return True
+    from xskill.agents.session_catalog import _session_roots
+
+    return any(
+        resolved == root or _is_relative_to(resolved, root)
+        for root in _session_roots()
+    )
 
 
 def _file_was_read(path: Path) -> bool:
