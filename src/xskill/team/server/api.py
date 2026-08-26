@@ -1024,6 +1024,75 @@ def _team_skill_entry(skill_id: str, client_id: str) -> dict:
     return {"result": results[0]}
 
 
+@router.get("/trajectories/search")
+def team_trajectories_search(
+    query: str,
+    limit: int = 5,
+    names: str = "",
+    x_xskill_token: str | None = Header(default=None),
+    x_xskill_client: str | None = Header(default=None),
+    x_xskill_version: str | None = Header(default=None),
+) -> dict:
+    """搜已入库轨迹的 Atom 混合检索。同步 def：内部 embedding 是同步 HTTP。"""
+    _auth(x_xskill_token, x_xskill_client, x_xskill_version)
+    cleaned = (query or "").strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="empty query")
+    bounded_limit = max(1, min(int(limit), 20))
+    from xskill.traj_search import (
+        parse_search_names,
+        resolve_named_session_dirs,
+        search_indexed_trajectories,
+    )
+
+    name_list = parse_search_names(names)
+    dataset_dirs = None
+    unknown: list[str] = []
+    if name_list:
+        if _ctx.client_registry is None or _ctx.traj_root is None:
+            raise HTTPException(
+                status_code=503, detail="team context not initialized",
+            )
+        dataset_dirs, unknown = resolve_named_session_dirs(
+            name_list,
+            traj_root=_ctx.traj_root,
+            find_client_id=_ctx.client_registry.find_by_user_name,
+            dir_name_for=_ctx.client_registry.dir_name_for,
+        )
+    try:
+        results = search_indexed_trajectories(
+            cleaned, top_k=bounded_limit, dataset_dirs=dataset_dirs,
+        )
+    except Exception:
+        request_id = f"traj-search-{secrets.token_hex(8)}"
+        server_logger.exception(
+            "team trajectory search failed request_id=%s query_length=%d",
+            request_id, len(cleaned),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="trajectory search failed",
+        ) from None
+    if name_list:
+        corpus_empty = (
+            not results
+            and not unknown
+            and not any(path.is_dir() for _user, path in (dataset_dirs or []))
+        )
+    else:
+        from xskill.pipeline.registry import all_index_paths
+
+        corpus_empty = not results and not all_index_paths()
+    return {
+        "results": results,
+        "count": len(results),
+        "meta": {
+            "unknown_names": unknown,
+            "corpus_empty": corpus_empty,
+        },
+    }
+
+
 @router.get("/skill_hub/search")
 async def team_skill_hub_search(
     query: str,

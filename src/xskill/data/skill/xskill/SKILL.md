@@ -85,28 +85,28 @@ xskill import ./skills-parent --json
 
 ## Searching trajectories
 
-`xskill search traj` finds trajectories related to a natural-language query.
-The first shipping form reads a bundled mock catalog so agents can practice
-the command without a live index. Each hit is marked `source=mock`.
+`xskill search traj` searches already-ingested trajectories. After
+`xskill connect`, the query goes to the team server and runs Atom hybrid
+search (vector + BM25) on uploaded sessions. On a standalone machine it
+searches local indexed watch directories. Hits are atoms: each row names
+the parent `traj_id` and a short intent.
 
 ```bash
-xskill search traj memory leak
-xskill search traj "alembic migration" -k 3
-xskill search traj auth retry --json
+xskill search traj 内存泄漏
+xskill search traj "alembic 半迁移" -k 8
+xskill search traj --name alice,bob 发票核对 --json
 ```
 
-Human output is `score<TAB>status<TAB>skill<TAB>ecosystem<TAB>traj_id` plus
-the title. Use a hit's `traj_id` and summary when you later call
-`xskill generate` and want the instruction to name the evidence.
-
-When the team-server trajectory search lands, this same command will keep
-its argv; only the catalog behind it changes.
+Human output is `score<TAB>user<TAB>traj_id<TAB>atom_id` plus the intent.
+`--name` only applies in team mode. The command does not download files
+and does not return raw trajectory text. You can paste a `traj_id` into
+`xskill generate` when you want the instruction to name the evidence.
 
 ## Searching & sharing team skills
 
 ```bash
 xskill search <query...>       # search team skills; returns metadata only
-xskill search traj <query...>  # search trajectories (bundled mock catalog)
+xskill search traj <query...>  # search ingested trajectories on the team server
 xskill search <query...> --download  # legacy 10-slot LRU download + auto-install
 xskill download <skill-id>     # persist one result; interactively select harnesses
 xskill download <skill-id> --agent claude-code --agent codex -y  # for agents/scripts

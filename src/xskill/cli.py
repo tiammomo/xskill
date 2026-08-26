@@ -1159,11 +1159,35 @@ def cmd_search_hub(args, http=None, headers=None) -> int:
     return 0
 
 
-def cmd_search_traj(args) -> int:
-    """`xskill search traj <query>` —— 检索轨迹（当前读捆绑 mock 目录）。"""
-    import json as _json
+def _render_traj_hits(hits: list[dict], query: str, *, meta: dict | None = None) -> None:
+    unknown = list((meta or {}).get("unknown_names") or [])
+    if unknown:
+        _write_search_output(
+            "warning: 未识别工号 " + "、".join(unknown),
+            to_stderr=True,
+        )
+    if not hits:
+        if (meta or {}).get("corpus_empty"):
+            _write_search_output("轨迹索引尚未建成，或指定工号还没有可搜目录")
+        else:
+            _write_search_output(f"轨迹无匹配：{query}")
+        return
+    _write_search_output(f"traj search  query={query!r}  {len(hits)} hits")
+    for hit in hits:
+        user = hit.get("user") or "-"
+        atom_id = hit.get("atom_id") or "-"
+        _write_search_output(
+            f"{float(hit.get('score') or 0.0):.3f}\t{user}\t"
+            f"{hit.get('traj_id')}\t{atom_id}"
+        )
+        intent = hit.get("intent") or hit.get("summary") or ""
+        if intent:
+            _write_search_output(f"  {intent}")
 
-    from xskill.traj_search import search_trajectories
+
+def cmd_search_traj(args, http=None, headers=None) -> int:
+    """`xskill search traj <query>` —— 搜已入库轨迹（team 走 server，否则本机）。"""
+    from xskill.traj_search import parse_search_names
 
     query = " ".join(args.terms[1:]).strip()
     if not query:
@@ -1177,33 +1201,111 @@ def cmd_search_traj(args) -> int:
             "warning: --download 只对 skill 搜索有效，轨迹检索忽略",
             to_stderr=True,
         )
-    hits = search_trajectories(query, top_k=args.top_k)
+    names = parse_search_names(getattr(args, "name", "") or "")
+    force_team = getattr(args, "team", False)
+    force_local = getattr(args, "local", False)
+    if force_local:
+        return _cmd_search_traj_local(
+            query, top_k=args.top_k, json_mode=args.json, names=names,
+        )
+    if force_team:
+        return _cmd_search_traj_team(
+            query, args=args, http=http, headers=headers, names=names,
+        )
+    from xskill.runtime import role
+    if role() == "client":
+        return _cmd_search_traj_team(
+            query, args=args, http=http, headers=headers, names=names,
+        )
+    return _cmd_search_traj_local(
+        query, top_k=args.top_k, json_mode=args.json, names=names,
+    )
+
+
+def _cmd_search_traj_local(
+    query: str, *, top_k: int, json_mode: bool, names: list[str],
+) -> int:
+    import json as _json
+
+    from xskill.traj_search import search_indexed_trajectories
+
+    if names:
+        _write_search_output(
+            "warning: --name 仅 team 轨迹检索有效，本机检索忽略",
+            to_stderr=True,
+        )
+    try:
+        hits = search_indexed_trajectories(query, top_k=top_k)
+    except Exception as search_error:
+        _write_search_output(
+            f"error: 本地轨迹检索失败（{type(search_error).__name__}）",
+            to_stderr=True,
+        )
+        return 1
+    if json_mode:
+        _write_search_output(_json.dumps(hits, ensure_ascii=True, indent=2))
+        return 0
+    from xskill.pipeline.registry import all_index_paths
+
+    meta = {"corpus_empty": not hits and not all_index_paths()}
+    _render_traj_hits(hits, query, meta=meta)
+    return 0
+
+
+def _cmd_search_traj_team(
+    query: str, *, args, http=None, headers=None, names: list[str],
+) -> int:
+    import json as _json
+    import httpx
+
+    if http is None:
+        http, headers = _team_client_http_and_headers()
+        if http is None:
+            return 1
+    params = {"query": query, "limit": args.top_k}
+    if names:
+        params["names"] = ",".join(names)
+    try:
+        resp = http.get(
+            "/api/v1/team/trajectories/search",
+            params=params,
+            headers=headers,
+        )
+    except (httpx.HTTPError, OSError) as network_error:
+        _write_search_output(
+            f"error: 无法连接 team server（{type(network_error).__name__}），"
+            "server 可能未响应，请检查网络或联系管理员",
+            to_stderr=True,
+        )
+        return 1
+    if resp.status_code == 404:
+        _write_search_output(
+            "error: server 版本过旧，不支持轨迹检索，请管理员先升级 server",
+            to_stderr=True,
+        )
+        return 1
+    if resp.status_code != 200:
+        _write_search_output(
+            f"error: 轨迹检索失败 HTTP {resp.status_code}",
+            to_stderr=True,
+        )
+        return 1
+    payload = resp.json()
+    hits = payload.get("results") or []
+    meta = payload.get("meta") or {}
     if args.json:
         _write_search_output(_json.dumps(hits, ensure_ascii=True, indent=2))
         return 0
-    if not hits:
-        _write_search_output(f"mock traj 无匹配：{query}")
-        return 0
-    _write_search_output(
-        f"mock traj search  query={query!r}  {len(hits)} hits"
-    )
-    for hit in hits:
-        _write_search_output(
-            f"{hit['score']:.3f}\t{hit['status']}\t{hit['skill_used']}\t"
-            f"{hit['ecosystem']}\t{hit['traj_id']}"
-        )
-        title = hit.get("title") or ""
-        if title:
-            _write_search_output(f"  {title}")
+    _render_traj_hits(hits, query, meta=meta)
     return 0
 
 
 def cmd_search(args) -> int:
     """`xskill search` 部署模式自适应入口（#201）。
 
-    首词为 ``traj`` 时走轨迹检索（当前为捆绑 mock 目录）。其余词走 skill
-    搜索：``--team`` / ``--local`` 显式覆盖 > team client 状态文件
-    （已 connect → SkillHub 路径）> 本地技能库路径。
+    首词为 ``traj`` 时走轨迹检索（team 走 server 已入库轨迹，否则本机
+    Atom 索引）。其余词走 skill 搜索：``--team`` / ``--local`` 显式覆盖 >
+    team client 状态文件（已 connect → SkillHub 路径）> 本地技能库路径。
     """
     if args.terms and args.terms[0] == "traj":
         return cmd_search_traj(args)
@@ -2099,14 +2201,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_search = sub.add_parser(
         "search",
-        help="搜索 skill，或 `search traj <query>` 检索轨迹（当前为 mock 目录）",
+        help="搜索 skill，或 `search traj <query>` 检索已入库轨迹",
     )
     p_search.add_argument(
         "terms", nargs="+", metavar="QUERY",
         help="搜索词。首词为 traj 时其余词检索轨迹；否则拼成 skill 查询",
     )
     p_search.add_argument("--top-k", "-k", type=int, default=5,
-                          help="返回条数（skillhub 搜索最多 10）")
+                          help="返回条数（skillhub 搜索最多 10，轨迹检索最多 20）")
+    p_search.add_argument(
+        "--name", default="",
+        help="轨迹检索时限定工号，逗号分隔；仅 team 模式有效",
+    )
     p_search.add_argument(
         "--download", action="store_true",
         help="兼容旧 search：下载命中到 10 槽 LRU 并安装到已检测 harness",

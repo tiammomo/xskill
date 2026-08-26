@@ -105,7 +105,7 @@ def search(
     """AtomTask 检索（HybridSearch union+dedup）。
 
     返回每条 ``{atom_id, sources, vector_similarity?, bm25_score?, md_path,
-    traj_id, atom (load 的字段)}``。
+    traj_id, intent, summary, used_skills}``。
 
     ``min_similarity`` 仅对向量分数生效；BM25 命中没有归一化分，不过滤。
     ``success_filter`` 在 atom 层无意义（atom 没有 success 字段），保留参数
@@ -127,6 +127,7 @@ def search(
         h["md_path"] = str(Path(dataset_dir) / f"{atom.traj_id}.md")
         h["intent"] = atom.intent
         h["summary"] = atom.summary
+        h["used_skills"] = list(atom.used_skills or [])
         out.append(h)
     return out
 

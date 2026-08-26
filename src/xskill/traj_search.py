@@ -1,88 +1,157 @@
-"""`xskill search traj` 的检索实现。
+"""`xskill search traj` 的检索装配。
 
-当前用随包发布的 mock 轨迹目录做关键词打分，方便 /xskill 里演示
-「按指令找相关轨迹」的用法。team server 真检索接上后，只换
-``search_trajectories`` 的数据源即可。
+真正搜的是 Atom 混合检索（`xskill.utils.search.search` / `search_all`）：
+向量 + BM25，命中带 traj_id。本模块只负责按工号收窄目录、把原始命中
+收成 CLI / team API 共用的精简字段。不读随包假数据，不读轨迹原文。
 """
 from __future__ import annotations
 
-import json
-import re
+import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-_TOKEN_RE = re.compile(r"[a-z0-9_\u4e00-\u9fff]+", re.IGNORECASE)
+logger = logging.getLogger("xskill.traj_search")
 
-
-def bundled_mock_catalog_path() -> Path:
-    from importlib.resources import files
-
-    return Path(str(files("xskill") / "data" / "mock_trajectories.json"))
-
-
-def load_mock_trajectories(path: Path | None = None) -> list[dict[str, Any]]:
-    catalog_path = path or bundled_mock_catalog_path()
-    payload = json.loads(catalog_path.read_text(encoding="utf-8"))
-    rows = payload.get("trajectories")
-    if not isinstance(rows, list):
-        return []
-    return [row for row in rows if isinstance(row, dict) and row.get("traj_id")]
+SearchOne = Callable[..., list[dict[str, Any]]]
+SearchAll = Callable[..., list[dict[str, Any]]]
+FindClientId = Callable[[str], str | None]
+DirNameFor = Callable[[str], str]
 
 
-def _tokens(text: str) -> list[str]:
-    return [part.lower() for part in _TOKEN_RE.findall(text or "")]
+def parse_search_names(raw: str | None) -> list[str]:
+    """把 ``--name 张三,李四`` 收成去空白的工号列表，保持用户写下的顺序。"""
+    names: list[str] = []
+    seen: set[str] = set()
+    for part in str(raw or "").split(","):
+        name = part.strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
 
 
-def _haystack(row: dict[str, Any]) -> str:
-    tags = row.get("tags") or []
-    tag_text = " ".join(str(tag) for tag in tags)
-    return " ".join(
-        str(row.get(key) or "")
-        for key in (
-            "traj_id", "title", "summary", "skill_used",
-            "ecosystem", "user", "status",
-        )
-    ) + " " + tag_text
+def format_traj_hit(raw: dict[str, Any], *, user: str = "") -> dict[str, Any]:
+    """把 ``search`` 的 Atom 命中收成对外字段，去掉路径和原文。"""
+    vector = raw.get("vector_similarity")
+    bm25 = raw.get("bm25_score")
+    if vector is None:
+        score = float(bm25 or 0.0)
+    else:
+        score = float(vector)
+    used = raw.get("used_skills") or []
+    if not used:
+        atom = raw.get("atom")
+        if atom is not None:
+            used = getattr(atom, "used_skills", None) or []
+    if not isinstance(used, list):
+        used = []
+    sources = raw.get("sources") or []
+    if not isinstance(sources, list):
+        sources = []
+    return {
+        "traj_id": str(raw.get("traj_id") or ""),
+        "atom_id": str(raw.get("atom_id") or ""),
+        "intent": str(raw.get("intent") or ""),
+        "summary": str(raw.get("summary") or ""),
+        "score": score,
+        "vector_similarity": vector,
+        "bm25_score": bm25,
+        "sources": [str(item) for item in sources],
+        "user": user,
+        "used_skills": [str(item) for item in used],
+    }
 
 
-def score_trajectory(query: str, row: dict[str, Any]) -> float:
-    """按查询词在标题 / 摘要 / 标签里的命中比例打 0–1 分。"""
-    query_tokens = _tokens(query)
-    if not query_tokens:
-        return 0.0
-    hay = set(_tokens(_haystack(row)))
-    if not hay:
-        return 0.0
-    hits = sum(1 for token in query_tokens if token in hay)
-    return hits / len(query_tokens)
+def _hit_sort_key(hit: dict[str, Any]) -> tuple:
+    # 有向量分的排前面；只有 BM25 的排后面。同档再按分数、traj_id。
+    has_vector = 0 if hit.get("vector_similarity") is None else 1
+    return (
+        -has_vector,
+        -float(hit.get("score") or 0.0),
+        str(hit.get("traj_id") or ""),
+    )
 
 
-def search_trajectories(
+def user_label_for_dataset(dataset_dir: str | Path) -> str:
+    """用 registry 的 watch 目录 label（工号目录名）当命中上的 user。"""
+    from xskill.pipeline.registry import list_watch_dirs
+
+    target = str(Path(dataset_dir).expanduser().resolve())
+    for row in list_watch_dirs():
+        path = row.get("path")
+        if not path:
+            continue
+        if str(Path(path).expanduser().resolve()) == target:
+            return str(row.get("label") or "")
+    return ""
+
+
+def resolve_named_session_dirs(
+    names: list[str],
+    *,
+    traj_root: Path,
+    find_client_id: FindClientId,
+    dir_name_for: DirNameFor,
+) -> tuple[list[tuple[str, Path]], list[str]]:
+    """工号 → ``<traj_root>/clients/<dir>/sessions``。不认识的工号进 unknown。"""
+    found: list[tuple[str, Path]] = []
+    unknown: list[str] = []
+    root = Path(traj_root)
+    for name in names:
+        client_id = find_client_id(name)
+        if not client_id:
+            unknown.append(name)
+            continue
+        try:
+            dir_name = dir_name_for(client_id)
+        except ValueError:
+            unknown.append(name)
+            continue
+        found.append((name, root / "clients" / dir_name / "sessions"))
+    return found, unknown
+
+
+def search_indexed_trajectories(
     query: str,
     *,
     top_k: int = 5,
-    catalog: list[dict[str, Any]] | None = None,
-    catalog_path: Path | None = None,
+    dataset_dirs: list[tuple[str, Path]] | None = None,
+    search_one: SearchOne | None = None,
+    search_all_fn: SearchAll | None = None,
 ) -> list[dict[str, Any]]:
-    """返回按 score 降序的轨迹命中。默认读捆绑 mock 目录。"""
-    rows = catalog if catalog is not None else load_mock_trajectories(catalog_path)
-    scored: list[dict[str, Any]] = []
-    for row in rows:
-        score = score_trajectory(query, row)
-        if score <= 0:
-            continue
-        scored.append({
-            "traj_id": row.get("traj_id"),
-            "score": round(float(score), 3),
-            "status": row.get("status") or "-",
-            "skill_used": row.get("skill_used") or "-",
-            "ecosystem": row.get("ecosystem") or "-",
-            "user": row.get("user") or "-",
-            "title": row.get("title") or "",
-            "summary": row.get("summary") or "",
-            "tags": list(row.get("tags") or []),
-            "source": "mock",
-        })
-    scored.sort(key=lambda item: (-item["score"], str(item["traj_id"])))
+    """在指定 sessions 目录或全量 registry 上跑 Atom 混合检索。"""
+    from xskill.utils.search import search as default_search_one
+    from xskill.utils.search import search_all as default_search_all
+
+    one = search_one or default_search_one
+    all_fn = search_all_fn or default_search_all
     limit = max(1, int(top_k))
-    return scored[:limit]
+    merged: list[dict[str, Any]] = []
+
+    if dataset_dirs is None:
+        raw_hits = all_fn(query_text=query, top_k=limit)
+        for raw in raw_hits:
+            dataset = raw.get("dataset_dir") or ""
+            user = str(raw.get("user") or "") or user_label_for_dataset(dataset)
+            merged.append(format_traj_hit(raw, user=user))
+        merged.sort(key=_hit_sort_key)
+        return merged[:limit]
+
+    for user, path in dataset_dirs:
+        directory = Path(path)
+        if not directory.is_dir():
+            continue
+        try:
+            raw_hits = one(
+                dataset_dir=directory,
+                query_text=query,
+                top_k=limit,
+            )
+        except Exception:
+            logger.warning("traj search skipped directory %s", directory, exc_info=True)
+            continue
+        for raw in raw_hits:
+            merged.append(format_traj_hit(raw, user=user))
+    merged.sort(key=_hit_sort_key)
+    return merged[:limit]
