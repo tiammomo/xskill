@@ -22,6 +22,7 @@ from xskill.traj_search import (
     format_traj_hit,
     parse_search_names,
     resolve_named_session_dirs,
+    resolve_registered_session_dirs,
     search_indexed_trajectories,
 )
 from xskill.utils.search import HybridSearch
@@ -271,6 +272,21 @@ def test_resolve_named_session_dirs_dir_lookup_failure_is_unknown(tmp_path):
     )
     assert found == []
     assert unknown == ["alice"]
+
+
+def test_resolve_registered_session_dirs_only_uses_team_clients(tmp_path):
+    found = resolve_registered_session_dirs(
+        [
+            {"client_id": "cid-a", "user_name": "alice"},
+            {"client_id": "cid-b", "user_name": ""},
+        ],
+        traj_root=tmp_path,
+        dir_name_for={"cid-a": "alice", "cid-b": "cid-b"}.get,
+    )
+    assert found == [
+        ("alice", tmp_path / "clients" / "alice" / "sessions"),
+        ("cid-b", tmp_path / "clients" / "cid-b" / "sessions"),
+    ]
 
 
 def test_hybrid_search_one_returns_atom_fields_not_raw(tmp_path):
@@ -529,6 +545,7 @@ def test_team_traj_search_named_dir_uses_real_hybrid_search(tmp_path, monkeypatc
     monkeypatch.setattr(
         "xskill.utils.search.create_embed_client", lambda _cfg=None: _FakeEmbed(),
     )
+    monkeypatch.setattr("xskill.utils.search.load_config", lambda: {})
     response = client.get(
         "/api/v1/team/trajectories/search",
         params={"query": "django migration", "limit": 5, "names": "alice,ghost"},
@@ -570,17 +587,22 @@ def test_team_traj_search_unknown_names_do_not_fail(tmp_path, monkeypatch):
     assert payload["meta"]["corpus_empty"] is False
 
 
-def test_team_traj_search_all_uses_search_all(tmp_path, monkeypatch):
-    client, _traj_root, _reg = _make_team_app(tmp_path)
+def test_team_traj_search_all_scopes_to_registered_team_dirs(tmp_path, monkeypatch):
+    client, traj_root, registry = _make_team_app(tmp_path)
     headers = _register(client, "alice")
+    client_id = registry.find_by_user_name("alice")
+    sessions = traj_root / "clients" / registry.dir_name_for(client_id) / "sessions"
+    sessions.mkdir(parents=True)
 
-    def search_all_fn(*, query_text, top_k, **_kwargs):
+    def search_one(*, dataset_dir, query_text, top_k, **_kwargs):
         assert query_text == "auth retry"
+        assert Path(dataset_dir) == sessions
         return [_atom_hit(user="alice")]
 
-    monkeypatch.setattr("xskill.utils.search.search_all", search_all_fn)
+    monkeypatch.setattr("xskill.utils.search.search", search_one)
     monkeypatch.setattr(
-        "xskill.pipeline.registry.all_index_paths", lambda: [Path("/idx")],
+        "xskill.utils.search.search_all",
+        lambda **_kwargs: pytest.fail("team search must not scan global registry"),
     )
     response = client.get(
         "/api/v1/team/trajectories/search",

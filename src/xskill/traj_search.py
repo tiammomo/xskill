@@ -112,6 +112,29 @@ def resolve_named_session_dirs(
     return found, unknown
 
 
+def resolve_registered_session_dirs(
+    client_rows: list[dict[str, Any]],
+    *,
+    traj_root: Path,
+    dir_name_for: DirNameFor,
+) -> list[tuple[str, Path]]:
+    """已注册 team client → 各自的 sessions 目录，不包含 server 本地 watch dir。"""
+    found: list[tuple[str, Path]] = []
+    root = Path(traj_root)
+    for row in client_rows:
+        client_id = str(row.get("client_id") or "").strip()
+        if not client_id:
+            continue
+        try:
+            dir_name = dir_name_for(client_id)
+        except ValueError:
+            logger.warning("traj search skipped unknown client %s", client_id)
+            continue
+        user = str(row.get("user_name") or client_id)
+        found.append((user, root / "clients" / dir_name / "sessions"))
+    return found
+
+
 def search_indexed_trajectories(
     query: str,
     *,

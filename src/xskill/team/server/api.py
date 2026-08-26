@@ -1042,21 +1042,27 @@ def team_trajectories_search(
     from xskill.traj_search import (
         parse_search_names,
         resolve_named_session_dirs,
+        resolve_registered_session_dirs,
         search_indexed_trajectories,
     )
 
+    if _ctx.client_registry is None or _ctx.traj_root is None:
+        raise HTTPException(
+            status_code=503, detail="team context not initialized",
+        )
     name_list = parse_search_names(names)
-    dataset_dirs = None
     unknown: list[str] = []
     if name_list:
-        if _ctx.client_registry is None or _ctx.traj_root is None:
-            raise HTTPException(
-                status_code=503, detail="team context not initialized",
-            )
         dataset_dirs, unknown = resolve_named_session_dirs(
             name_list,
             traj_root=_ctx.traj_root,
             find_client_id=_ctx.client_registry.find_by_user_name,
+            dir_name_for=_ctx.client_registry.dir_name_for,
+        )
+    else:
+        dataset_dirs = resolve_registered_session_dirs(
+            _ctx.client_registry.list(),
+            traj_root=_ctx.traj_root,
             dir_name_for=_ctx.client_registry.dir_name_for,
         )
     try:
@@ -1073,16 +1079,11 @@ def team_trajectories_search(
             status_code=500,
             detail="trajectory search failed",
         ) from None
-    if name_list:
-        corpus_empty = (
-            not results
-            and not unknown
-            and not any(path.is_dir() for _user, path in (dataset_dirs or []))
-        )
-    else:
-        from xskill.pipeline.registry import all_index_paths
-
-        corpus_empty = not results and not all_index_paths()
+    corpus_empty = (
+        not results
+        and not unknown
+        and not any(path.is_dir() for _user, path in dataset_dirs)
+    )
     return {
         "results": results,
         "count": len(results),
