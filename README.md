@@ -206,7 +206,7 @@ xskill serve --server  # 会打印connect join命令，复制给组内同事便�
 
 普通用户执行：
 ```bash
-xskill connect <host:port> --token <token>  --name <工号/姓名>   # 在每个同事的机器上运行
+xskill connect <host:port> --token <token>  --name <工号/姓名>   # 握手后把 /xskill 使用指南装进本机已探测的 agent
 ```
 
 #### 额外功能：管控面板

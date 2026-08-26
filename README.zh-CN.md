@@ -96,7 +96,7 @@ xskill 真正想在组织里铺开的形态是团队模式：一台机器当 ser
 
 ```bash
 xskill serve --server                        # 启动后打印 join token
-xskill connect <host:port> --token <token>
+xskill connect <host:port> --token <token>   # 握手后把 /xskill 使用指南装进本机已探测的 agent
 ```
 
 - **无感蒸馏大佬员工** 一个人在自己工作里跑通的解法，自动可以让全团队复用，不需要任何人做任何事。（能力民主化）

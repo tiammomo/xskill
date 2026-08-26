@@ -44,13 +44,15 @@ def install_recorder(monkeypatch):
     """把所有 install_to_* 换成记录调用的桩，返回被安装到的生态列表。"""
     installed = []
     for eco in ("claude_code", "codex", "nga3", "opencode", "ngagent",
-                "openclaw", "cursor", "trae"):
+                "openclaw", "cursor", "trae", "deepseek_harness"):
         def _make(eco_name):
             def _fake(skill_path, target_root=None, side="main"):
                 installed.append(eco_name)
                 return Path(skill_path) / "SKILL.md"
             return _fake
-        monkeypatch.setattr(f"xskill.ecosystems.install_to_{eco}", _make(eco))
+        monkeypatch.setattr(
+            f"xskill.ecosystems.install_to_{eco}", _make(eco),
+        )
     return installed
 
 
@@ -88,6 +90,7 @@ def test_no_skill_connects_without_installing(
     assert captured["address"] == "1.2.3.4:8000"
     assert captured["token"] == "TOK"
     assert captured["name"] == "007"
+    assert captured["no_skill"] is True  # init 已经决定过装不装，connect 不再装一次
 
 
 def test_existing_daemon_kept_when_no_force_noninteractive(monkeypatch):

@@ -49,6 +49,7 @@ Settings → Privacy & security → For developers → **Developer Mode: On**.
 | OpenCode | `~/.agents/skills/` (shared user scope) |
 | Cursor | `~/.cursor/skills/` |
 | Trae | IDE workspace storage, `~/.trae-cn`, or CLI trajectory dir (auto-detected) |
+| DeepSeek Harness | `~/.dsh/skills/` |
 
 Codex, OpenCode, and OpenClaw share `~/.agents/skills/`, so installing a skill
 once makes it visible to all three.

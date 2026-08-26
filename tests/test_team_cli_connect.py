@@ -75,6 +75,11 @@ def _install_fakes(monkeypatch):
         "xskill.team.client.service.get_backend",
         lambda: _FakeBackend(),
     )
+    # connect 成功后会把 /xskill 装进探测到的 agent；这些用例只测握手，不碰真实 HOME
+    monkeypatch.setattr(
+        "xskill.ecosystems.bundled_guide.install_bundled_xskill_guide",
+        lambda target_root=None: [],
+    )
     return captured
 
 
@@ -192,6 +197,10 @@ def test_connect_foreground_runs_forever_not_backend(tmp_path, monkeypatch):
 
     monkeypatch.setattr("httpx.Client", lambda **kw: object())
     monkeypatch.setattr("xskill.team.client.daemon.TeamClient", _FakeTeam)
+    monkeypatch.setattr(
+        "xskill.ecosystems.bundled_guide.install_bundled_xskill_guide",
+        lambda target_root=None: [],
+    )
 
     class _NoStartBackend(_FakeBackend):
         def install_and_start(self):
@@ -237,6 +246,10 @@ def test_connect_unsupported_platform_falls_back_to_foreground(
 
     monkeypatch.setattr("httpx.Client", lambda **kw: object())
     monkeypatch.setattr("xskill.team.client.daemon.TeamClient", _FakeTeam)
+    monkeypatch.setattr(
+        "xskill.ecosystems.bundled_guide.install_bundled_xskill_guide",
+        lambda target_root=None: [],
+    )
     monkeypatch.setattr("xskill.team.client.service.get_backend",
                         lambda: _Unsupported())
 
@@ -245,3 +258,65 @@ def test_connect_unsupported_platform_falls_back_to_foreground(
     rc = cmd_connect(args)
     assert rc == 0
     assert ran["forever"] == 1  # 退化成前台阻塞
+
+
+def test_connect_installs_bundled_guide_after_handshake(tmp_path, monkeypatch):
+    """握手成功后、拉起后台之前，把 /xskill 装进探测到的 agent。"""
+    monkeypatch.setattr("xskill.config.get_team_client_state_path",
+                        lambda: tmp_path / "team_client.json")
+    _install_fakes(monkeypatch)
+    called = []
+    monkeypatch.setattr(
+        "xskill.ecosystems.bundled_guide.install_bundled_xskill_guide",
+        lambda target_root=None: called.append(target_root) or ["claude_code"],
+    )
+    parser = build_parser()
+    args = parser.parse_args([
+        "connect", "1.2.3.4:8000", "--token", "t",
+        "--target-root", str(tmp_path / "home"),
+    ])
+    rc = cmd_connect(args)
+    assert rc == 0
+    assert called == [str(tmp_path / "home")]
+
+
+def test_connect_no_skill_skips_bundled_guide(tmp_path, monkeypatch):
+    monkeypatch.setattr("xskill.config.get_team_client_state_path",
+                        lambda: tmp_path / "team_client.json")
+    _install_fakes(monkeypatch)
+    called = []
+    monkeypatch.setattr(
+        "xskill.ecosystems.bundled_guide.install_bundled_xskill_guide",
+        lambda target_root=None: called.append(True),
+    )
+    parser = build_parser()
+    args = parser.parse_args([
+        "connect", "1.2.3.4:8000", "--token", "t", "--no-skill",
+    ])
+    rc = cmd_connect(args)
+    assert rc == 0
+    assert called == []
+
+
+def test_connect_failed_handshake_does_not_install_guide(monkeypatch):
+    """token 缺失时握手失败，不能去装 skill。"""
+    called = []
+    monkeypatch.setattr(
+        "xskill.ecosystems.bundled_guide.install_bundled_xskill_guide",
+        lambda target_root=None: called.append(True),
+    )
+    parser = build_parser()
+    args = parser.parse_args(["connect", "1.2.3.4:8000"])
+    rc = cmd_connect(args)
+    assert rc != 0
+    assert called == []
+
+
+def test_connect_parses_no_skill_and_target_root():
+    parser = build_parser()
+    args = parser.parse_args([
+        "connect", "1.2.3.4:8000", "--token", "t",
+        "--no-skill", "--target-root", "/tmp/iso",
+    ])
+    assert args.no_skill is True
+    assert args.target_root == "/tmp/iso"

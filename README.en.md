@@ -131,7 +131,7 @@ One machine is the server; everyone else joins as a thin client and works agains
 
 ```bash
 xskill serve --server                          # prints a join token
-xskill connect <host:port> --token <token>     # on each teammate's machine
+xskill connect <host:port> --token <token>     # also installs the /xskill guide into detected agents
 ```
 
 - **Silently distill your top performers** — one person's solution reaches the whole team automatically.

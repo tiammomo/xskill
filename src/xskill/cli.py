@@ -189,47 +189,8 @@ def cmd_init(args) -> int:
         target_root = Path(args.target_root).expanduser().resolve()
 
     if not args.no_skill:
-        from importlib.resources import files
-        from xskill.ecosystems import (
-            detect_known_ecosystems,
-            install_to_claude_code, install_to_codex, install_to_cursor,
-            install_to_deepseek_harness,
-            install_to_nga3, install_to_ngagent, install_to_openclaw,
-            install_to_opencode, install_to_trae,
-        )
-        installer_by_eco = {
-            "claude_code": install_to_claude_code,
-            "codex": install_to_codex,
-            "nga3": install_to_nga3,
-            "opencode": install_to_opencode,
-            "ngagent": install_to_ngagent,
-            "openclaw": install_to_openclaw,
-            "cursor": install_to_cursor,
-            "trae": install_to_trae,
-            "deepseek_harness": install_to_deepseek_harness,
-        }
-        skill_source = Path(str(files("xskill") / "data" / "skill" / "xskill"))
-        if not (skill_source / "SKILL.md").is_file():
-            print(f"warning: 捆绑的 xskill skill 缺失（{skill_source}），跳过装 skill",
-                  file=sys.stderr)
-        else:
-            installed_ecosystems = []
-            for detection in detect_known_ecosystems(home_root=target_root):
-                install_fn = installer_by_eco.get(detection["ecosystem"])
-                if install_fn is None:
-                    continue
-                try:
-                    install_fn(skill_source, target_root=target_root, side="main")
-                    installed_ecosystems.append(detection["ecosystem"])
-                except Exception as install_error:  # noqa: BLE001
-                    print(f"warning: 装到 {detection['ecosystem']} 失败：{install_error}",
-                          file=sys.stderr)
-            if installed_ecosystems:
-                print(f"已把 xskill 使用指南装进 {'/'.join(installed_ecosystems)} 的 "
-                      f"skill 目录，在对应 agent 里可直接 /xskill 查用法。")
-            else:
-                print("未检测到已知 agent 生态（claude_code/codex/opencode/cursor/… "
-                      "均未发现），跳过装 skill。")
+        from xskill.ecosystems.bundled_guide import install_bundled_xskill_guide
+        install_bundled_xskill_guide(target_root=target_root)
 
     if args.skills_only:
         return 0
@@ -284,6 +245,7 @@ def cmd_init(args) -> int:
         address=address, token=token, label=args.label, name=name,
         use_proxy=args.use_proxy, foreground=args.foreground,
         no_auto_update=args.no_auto_update,
+        no_skill=True,
     )
     exit_code = cmd_connect(connect_args)
     if exit_code == 0:
@@ -319,6 +281,14 @@ def cmd_connect(args) -> int:
         except FileNotFoundError as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
+
+    # 握手或复用已存连接成功后再装 /xskill：前台阻塞循环开始前必须先装，
+    # 否则 Linux 退化成 run_forever 后这条命令再也走不到安装。
+    if not getattr(args, "no_skill", False):
+        from xskill.ecosystems.bundled_guide import install_bundled_xskill_guide
+        install_bundled_xskill_guide(
+            target_root=getattr(args, "target_root", None),
+        )
 
     from xskill.team.client.service import ServiceError, get_backend
     backend = get_backend()
@@ -2212,6 +2182,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_conn.add_argument(
         "--no-auto-update", action="store_true", dest="no_auto_update",
         help="禁用自动更新检查（默认每小时查一次 PyPI，有新版则升级重启）。",
+    )
+    p_conn.add_argument(
+        "--no-skill", action="store_true", dest="no_skill",
+        help="只连 server，不把 /xskill 使用指南装进本机已探测的 agent",
+    )
+    p_conn.add_argument(
+        "--target-root", default=None,
+        help="[测试/隔离] 安装与探测的 HOME 根（默认真实 HOME）",
     )
 
     p_start = sub.add_parser(

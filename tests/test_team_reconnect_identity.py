@@ -225,6 +225,10 @@ def test_cli_connect_with_address_reads_existing_state(tmp_path, monkeypatch):
     def _fake_client(*a, **kw):
         return fake
     monkeypatch.setattr("httpx.Client", _fake_client)
+    monkeypatch.setattr(
+        "xskill.ecosystems.bundled_guide.install_bundled_xskill_guide",
+        lambda target_root=None: [],
+    )
 
     # 跑到 run_forever 之前会构造 TeamClient——也得拦下，否则会去拉
     # collector 等真实组件。直接让 TeamClient.run_forever 立即返回。
@@ -264,6 +268,10 @@ def test_cli_connect_with_address_no_state_sends_null_claimed_id(
 
     fake = _FakeHttp()
     monkeypatch.setattr("httpx.Client", lambda *a, **kw: fake)
+    monkeypatch.setattr(
+        "xskill.ecosystems.bundled_guide.install_bundled_xskill_guide",
+        lambda target_root=None: [],
+    )
     monkeypatch.setattr(
         "xskill.team.client.daemon.TeamClient.run_forever",
         lambda self: None,
