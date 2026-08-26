@@ -89,12 +89,23 @@ def wiki_status() -> str:
     root = _wiki_root()
     if isinstance(root, str):
         return root
-    pages = sorted(
-        p.relative_to(root).as_posix() for p in root.rglob("*.md") if p.is_file()
-    )
-    index = root / "index.md"
+    pages: list[str] = []
+    seen: set[str] = set()
+    for candidate in root.rglob("*.md"):
+        try:
+            resolved = candidate.resolve()
+            rel = resolved.relative_to(root)
+        except (OSError, ValueError):
+            continue
+        key = str(resolved)
+        if key in seen or not resolved.is_file():
+            continue
+        seen.add(key)
+        pages.append(rel.as_posix())
+    pages.sort()
+    index = _resolve_page(root, "index.md")
     head = ""
-    if index.is_file():
+    if isinstance(index, Path) and index.is_file():
         head = "\n".join(index.read_text(encoding="utf-8").splitlines()[:40])
     return (
         f"wiki_root={root}\npages={len(pages)}\n"
@@ -154,12 +165,18 @@ def wiki_search(pattern: str, max_results: int = 40) -> str:
         return f"error: 非法正则: {exc}"
     take = max(1, min(int(max_results or 40), 80))
     hits: list[str] = []
-    for path in sorted(root.rglob("*.md")):
+    seen: set[str] = set()
+    for candidate in sorted(root.rglob("*.md")):
         try:
+            path = candidate.resolve()
+            rel = path.relative_to(root).as_posix()
+            key = str(path)
+            if key in seen or not path.is_file():
+                continue
+            seen.add(key)
             lines = path.read_text(encoding="utf-8").splitlines()
-        except OSError:
+        except (OSError, ValueError):
             continue
-        rel = path.relative_to(root).as_posix()
         for i, line in enumerate(lines, 1):
             if cre.search(line):
                 hits.append(f"{rel}:{i}:{line[:200]}")
@@ -179,7 +196,9 @@ def wiki_log(entry: str) -> str:
         return "error: entry 为空"
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     line = f"## [{stamp}] {text}\n"
-    log = root / "log.md"
+    log = _resolve_page(root, "log.md")
+    if isinstance(log, str):
+        return log
     prev = log.read_text(encoding="utf-8") if log.is_file() else "# log\n\n"
     if not prev.endswith("\n"):
         prev += "\n"
@@ -190,7 +209,9 @@ def wiki_log(entry: str) -> str:
 def _touch_index(root: Path, rel: str, *, created: bool) -> None:
     if rel in {"index.md", "log.md", "SCHEMA.md"} or not created:
         return
-    index = root / "index.md"
+    index = _resolve_page(root, "index.md")
+    if isinstance(index, str):
+        return
     if not index.is_file():
         return
     text = index.read_text(encoding="utf-8")

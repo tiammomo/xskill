@@ -396,7 +396,7 @@ def list_sessions(offset: int = 0, limit: int = 60, query: str = "") -> str:
         lines.append(
             f"continue: list_sessions(offset={start + take}, limit={take}, query={query!r})"
         )
-    return "\n".join(lines)
+    return _secret_scrub("\n".join(lines))
 
 
 @tool(name="session_card")

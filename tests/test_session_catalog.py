@@ -149,6 +149,26 @@ def test_markdown_card_is_scrubbed_and_does_not_expose_absolute_path(tmp_path: P
     assert str(live) not in card
 
 
+def test_json_metadata_is_scrubbed_from_session_listing(tmp_path: Path):
+    ctx = _ctx(tmp_path)
+    live = Path(ctx.default_traj_root)
+    (live / "traj_secret_metadata.json").write_text(
+        json.dumps({
+            "source": "token=source-secret",
+            "query": "safe query",
+            "tool_names": ["Read", "password=tool-secret"],
+        }),
+        encoding="utf-8",
+    )
+
+    with agent_tools.use_agent_tool_context(ctx):
+        listing = list_sessions.entrypoint()
+
+    assert "source-secret" not in listing
+    assert "tool-secret" not in listing
+    assert "[REDACTED]" in listing
+
+
 def test_pagination_reads_only_page_and_batch_reuses_one_scan(
     tmp_path: Path, monkeypatch,
 ):

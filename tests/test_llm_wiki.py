@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from xskill.agents import agent_tools
 from xskill.agents.llm_wiki import (
     seed_generate_wiki,
@@ -49,3 +51,26 @@ def test_wiki_rejects_escape(tmp_path: Path):
     with agent_tools.use_agent_tool_context(ctx):
         denied = wiki_read.entrypoint(path="../secret.md")
     assert denied.startswith("error:")
+
+
+def test_wiki_tools_do_not_follow_markdown_symlink_outside_root(tmp_path: Path):
+    root = seed_generate_wiki(tmp_path / "wiki")
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside-secret\n", encoding="utf-8")
+    escaped = root / "pages" / "escaped.md"
+    try:
+        escaped.symlink_to(outside)
+    except OSError:
+        pytest.skip("当前平台不允许创建测试符号链接")
+    ctx = agent_tools.create_agent_tool_context(
+        skill_dir=tmp_path / "skill",
+        wiki_root=root,
+    )
+    (tmp_path / "skill").mkdir()
+
+    with agent_tools.use_agent_tool_context(ctx):
+        status = wiki_status.entrypoint()
+        hits = wiki_search.entrypoint(pattern="outside-secret")
+
+    assert "escaped.md" not in status
+    assert hits.startswith("(no hits for")
