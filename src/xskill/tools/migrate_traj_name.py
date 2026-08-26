@@ -27,6 +27,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import shutil
@@ -40,6 +41,46 @@ logger = logging.getLogger(__name__)
 
 BACKUP_DIR_NAME = "migrate_backup"
 MANIFEST_NAME = "manifest.json"
+
+
+def _path_digest(path: Path) -> Optional[str]:
+    """Return a stable content digest without following directory symlinks."""
+    if not path.exists() and not path.is_symlink():
+        return None
+    digest = hashlib.sha256()
+    if path.is_symlink():
+        digest.update(b"link\0")
+        digest.update(str(path.readlink()).encode("utf-8"))
+        return digest.hexdigest()
+    if path.is_file():
+        digest.update(b"file\0")
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    digest.update(b"dir\0")
+    for child in sorted(path.rglob("*"), key=lambda item: item.as_posix()):
+        relative = child.relative_to(path).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        if child.is_symlink():
+            digest.update(b"link\0")
+            digest.update(str(child.readlink()).encode("utf-8"))
+        elif child.is_file():
+            digest.update(b"file\0")
+            with child.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        elif child.is_dir():
+            digest.update(b"dir\0")
+    return digest.hexdigest()
+
+
+def _backup_bucket(backup_root: Path, directory: Path, old_id: str) -> Path:
+    directory_key = hashlib.sha256(
+        str(directory.resolve()).encode("utf-8"),
+    ).hexdigest()[:16]
+    return backup_root / "entries" / directory_key / old_id
 
 @dataclass
 class RenamePlan:
@@ -209,8 +250,8 @@ def _apply_plan(
             logger.warning("目标已存在，跳过 %s → %s", plan.old_id, plan.new_id)
             return False
 
-    # 备份：整份复制（含原子目录），保持相对 <backup>/<目录名哈希>/ 布局
-    bucket = backup_root / plan.directory.name / plan.old_id
+    # 目录 basename 可能都叫 sessions；用完整路径哈希隔离不同成员的备份。
+    bucket = _backup_bucket(backup_root, plan.directory, plan.old_id)
     bucket.mkdir(parents=True, exist_ok=True)
     for old, _ in pairs:
         if old.is_dir():
@@ -224,6 +265,8 @@ def _apply_plan(
         "new_id": plan.new_id,
         "renames": [],
         "db_updated": False,
+        "backup_bucket": str(bucket.relative_to(backup_root)),
+        "post_migration_digests": {},
     }
     for old, new in pairs:
         old.rename(new)
@@ -259,6 +302,9 @@ def _apply_plan(
                  str(plan.directory)),
             )
             entry["db_updated"] = cur.rowcount > 0
+    entry["post_migration_digests"] = {
+        str(new): _path_digest(new) for _, new in pairs
+    }
     manifest["entries"].append(entry)
     return True
 
@@ -283,9 +329,17 @@ def _rewrite_candidates(
         if new_text == text:
             continue
         backup_root.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(cand, backup_root / f"{cand.parent.name}.candidates.yml")
+        backup_name = hashlib.sha256(
+            str(cand.resolve()).encode("utf-8"),
+        ).hexdigest()[:16] + ".candidates.yml"
+        backup_path = backup_root / backup_name
+        shutil.copy2(cand, backup_path)
         cand.write_text(new_text, encoding="utf-8")
-        manifest["candidates"].append(str(cand))
+        manifest["candidates"].append({
+            "path": str(cand),
+            "backup": str(backup_path.relative_to(Path(manifest["backup_dir"]))),
+            "post_migration_digest": _path_digest(cand),
+        })
 
 
 def migrate_traj_names(
@@ -360,15 +414,34 @@ def rollback_traj_names(
     for entry in reversed(manifest.get("entries", [])):
         directory = Path(entry["directory"])
         old_id, new_id = entry["old_id"], entry["new_id"]
-        bucket = backup_dir / directory.name / old_id
+        bucket_rel = entry.get("backup_bucket")
+        if not bucket_rel:
+            logger.warning(
+                "备份缺少安全路径与迁移后摘要，拒绝破坏性回滚: %s",
+                new_id,
+            )
+            continue
+        bucket = backup_dir / bucket_rel
+        expected_digests = entry.get("post_migration_digests") or {}
+        renames = entry.get("renames", [])
+        if any(Path(old_str).exists() for old_str, _ in renames):
+            logger.warning("回滚目标已存在，整条跳过: %s", old_id)
+            continue
+        changed = False
+        for _, new_str in renames:
+            expected = expected_digests.get(new_str)
+            if expected is None or _path_digest(Path(new_str)) != expected:
+                logger.warning(
+                    "迁移后文件已变化或缺失，拒绝覆盖: %s", new_str,
+                )
+                changed = True
+                break
+        if changed:
+            continue
         ok = True
-        for old_str, new_str in reversed(entry.get("renames", [])):
+        for old_str, new_str in reversed(renames):
             new_path = Path(new_str)
             old_path = Path(old_str)
-            if old_path.exists():
-                logger.warning("回滚目标已存在，跳过: %s", old_path)
-                ok = False
-                continue
             src = bucket / old_path.name
             if src.exists():
                 # 从备份整份还原（原子目录内容已被改写，改回去不如用备份）
@@ -397,10 +470,21 @@ def rollback_traj_names(
         if ok:
             restored += 1
     # candidates 恢复
-    cand_backup = backup_dir / "candidates"
-    for saved in cand_backup.glob("*.candidates.yml") if cand_backup.is_dir() else []:
-        for cand_path in manifest.get("candidates", []):
-            cp = Path(cand_path)
-            if cp.parent.name == saved.name.replace(".candidates.yml", ""):
-                shutil.copy2(saved, cp)
+    for candidate in manifest.get("candidates", []):
+        if not isinstance(candidate, dict):
+            logger.warning("旧 candidates 备份缺少摘要，拒绝覆盖: %s", candidate)
+            continue
+        path = Path(candidate.get("path") or "")
+        expected = candidate.get("post_migration_digest")
+        backup_rel = candidate.get("backup")
+        if (
+            not expected
+            or not backup_rel
+            or _path_digest(path) != expected
+        ):
+            logger.warning("candidate 迁移后已变化，拒绝覆盖: %s", path)
+            continue
+        saved = backup_dir / backup_rel
+        if saved.is_file():
+            shutil.copy2(saved, path)
     return restored

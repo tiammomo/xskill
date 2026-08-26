@@ -391,6 +391,66 @@ class TestMigrateTrajName:
         assert payload["atom_id"] == f"atom_{old_id}_0001"
         assert not (bridge / f"traj_ng_proj_{short_sid(sid)}.md").exists()
 
+    def test_rollback_keeps_post_migration_edits(self, tmp_path):
+        from xskill.tools import migrate_traj_names, rollback_traj_names
+
+        home = tmp_path / "xskill_home"
+        bridge = home / "ng_sessions"
+        sid = "ses_abc123def456ghi789"
+        old_id = _make_bridged_traj(bridge, sid)
+        report = migrate_traj_names(xskill_home=home)
+        new_id = f"traj_ng_proj_{short_sid(sid)}"
+        migrated = bridge / f"{new_id}.md"
+        migrated.write_text("# edited after migration\n", encoding="utf-8")
+
+        restored = rollback_traj_names(
+            xskill_home=home, backup_dir=report.backup_dir,
+        )
+
+        assert restored == 0
+        assert migrated.read_text(encoding="utf-8") == "# edited after migration\n"
+        assert not (bridge / f"{old_id}.md").exists()
+
+    def test_same_named_member_directories_get_distinct_backups(self, tmp_path):
+        from xskill.tools import migrate_traj_names, rollback_traj_names
+
+        home = tmp_path / "xskill_home"
+        home.mkdir()
+        registry_path = tmp_path / "clients.db"
+        registry = ClientRegistry(registry_path)
+        alice_id = registry.register(
+            label="alice", hostname="alice-host", user_name="alice",
+        )
+        bob_id = registry.register(
+            label="bob", hostname="bob-host", user_name="bob",
+        )
+        traj_root = tmp_path / "team_traj"
+        old_id = "traj_ng_shared_ses_0f5d"
+        contents = {"alice": "# alice\n", "bob": "# bob\n"}
+        for member, content in contents.items():
+            sessions = traj_root / "clients" / member / "sessions"
+            sessions.mkdir(parents=True)
+            (sessions / f"{old_id}.md").write_text(content, encoding="utf-8")
+
+        report = migrate_traj_names(
+            xskill_home=home,
+            traj_root=traj_root,
+            clients_registry_db=registry_path,
+        )
+        assert report.renamed == 2
+
+        restored = rollback_traj_names(
+            xskill_home=home, backup_dir=report.backup_dir,
+        )
+
+        assert restored == 2
+        for member, content in contents.items():
+            restored_path = (
+                traj_root / "clients" / member / "sessions" / f"{old_id}.md"
+            )
+            assert restored_path.read_text(encoding="utf-8") == content
+        assert alice_id != bob_id
+
     def test_server_side_member_prefix_migration(self, tmp_path):
         """服务器侧：按 client 注册表反查目录归属，补成员前缀。"""
         from xskill.tools import migrate_traj_names
