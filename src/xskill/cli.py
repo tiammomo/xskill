@@ -2334,10 +2334,6 @@ def main() -> int:
     return handler(args, xskill) if handler else (parser.print_help() or 1)
 
 
-if __name__ == "__main__":
-    sys.exit(main() or 0)
-
-
 # ═══════════════════════════════════════════════════════════════
 # xskill privacy — 本机轨迹上传排除规则（issue #244）
 # ═══════════════════════════════════════════════════════════════
@@ -2560,3 +2556,7 @@ def cmd_privacy(args) -> int:
 
     print(f"error: unknown privacy action {action!r}", file=sys.stderr)
     return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
