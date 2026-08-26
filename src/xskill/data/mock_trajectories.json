@@ -1,0 +1,76 @@
+{
+  "source": "mock",
+  "note": "Bundled demo catalog for `xskill search traj`. Replace with team-server search when that API ships.",
+  "trajectories": [
+    {
+      "traj_id": "traj_cc_alice_memleak",
+      "ecosystem": "claude_code",
+      "user": "alice",
+      "status": "success",
+      "skill_used": "python-memory-debug",
+      "title": "Diagnose a Python process leaking memory",
+      "summary": "A long batch job leaked RSS until the worker OOM-killed. The session used tracemalloc, objgraph, and gc.get_objects to find a cache that never evicted.",
+      "tags": ["python", "memory", "leak", "oom", "batch"]
+    },
+    {
+      "traj_id": "traj_cc_bob_win_debug",
+      "ecosystem": "claude_code",
+      "user": "bob",
+      "status": "success",
+      "skill_used": "python-memory-debug",
+      "title": "Add Windows steps to a memory-debug skill",
+      "summary": "The Linux-only skill missed VMMap and Performance Monitor. The rewrite added Windows Developer Mode notes and junction vs symlink install failures.",
+      "tags": ["windows", "memory", "debug", "skill-edit"]
+    },
+    {
+      "traj_id": "traj_cursor_carol_migration",
+      "ecosystem": "cursor",
+      "user": "carol",
+      "status": "success",
+      "skill_used": "db-migration-playbook",
+      "title": "Roll forward a failed Alembic migration",
+      "summary": "A production Alembic revision left the database half-migrated. The session inspected alembic_version, wrote a data-backfill step, and documented a down revision.",
+      "tags": ["database", "alembic", "migration", "postgres"]
+    },
+    {
+      "traj_id": "traj_codex_dan_compose",
+      "ecosystem": "codex",
+      "user": "dan",
+      "status": "success",
+      "skill_used": "docker-compose-debug",
+      "title": "Unstick docker compose networking",
+      "summary": "A compose stack could not reach the database because the app service joined the wrong network and the healthcheck used localhost instead of the service name.",
+      "tags": ["docker", "compose", "network", "healthcheck"]
+    },
+    {
+      "traj_id": "traj_cc_erin_auth_retry",
+      "ecosystem": "claude_code",
+      "user": "erin",
+      "status": "success",
+      "skill_used": "http-auth-retry",
+      "title": "Retry 401s without hammering the token endpoint",
+      "summary": "An HTTP client refreshed tokens on every 401 and hit the IdP rate limit. The fix used a single-flight lock, jittered backoff, and a cached token expiry.",
+      "tags": ["auth", "retry", "http", "token", "rate-limit"]
+    },
+    {
+      "traj_id": "traj_dsh_frank_skill_import",
+      "ecosystem": "deepseek_harness",
+      "user": "frank",
+      "status": "success",
+      "skill_used": "",
+      "title": "Import a local skill folder into the team repo",
+      "summary": "The user had a hand-written SKILL.md and wanted it on main, not SkillHub. xskill import copied the folder, pinned it for the initiator, and kept the staging branch.",
+      "tags": ["import", "skill", "team", "pin"]
+    },
+    {
+      "traj_id": "traj_cc_gina_failed_oom",
+      "ecosystem": "claude_code",
+      "user": "gina",
+      "status": "failed",
+      "skill_used": "python-memory-debug",
+      "title": "Memory leak hunt stopped after the process died",
+      "summary": "tracemalloc was attached too late; the worker was already OOM-killed. The session never captured a snapshot and the user abandoned the debug.",
+      "tags": ["python", "memory", "leak", "failed", "oom"]
+    }
+  ]
+}

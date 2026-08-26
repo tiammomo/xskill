@@ -5,9 +5,10 @@ description: >-
   CLI — the team skill-distribution and trajectory-collection daemon. Use
   when a user asks how to install or join an xskill team server, run
   `xskill generate` to write or rewrite a skill from team trajectories,
-  upgrade xskill, fix a stuck/black-window/copy-mode install, run xskill
-  in the background on Windows/macOS/Linux/WSL, search or share team
-  skills, import an existing skill, or read the dashboard.
+  search trajectories with `xskill search traj`, upgrade xskill, fix a
+  stuck/black-window/copy-mode install, run xskill in the background on
+  Windows/macOS/Linux/WSL, search or share team skills, import an existing
+  skill, or read the dashboard.
 ---
 
 # xskill
@@ -82,10 +83,30 @@ xskill import ./my-skill
 xskill import ./skills-parent --json
 ```
 
+## Searching trajectories
+
+`xskill search traj` finds trajectories related to a natural-language query.
+The first shipping form reads a bundled mock catalog so agents can practice
+the command without a live index. Each hit is marked `source=mock`.
+
+```bash
+xskill search traj memory leak
+xskill search traj "alembic migration" -k 3
+xskill search traj auth retry --json
+```
+
+Human output is `score<TAB>status<TAB>skill<TAB>ecosystem<TAB>traj_id` plus
+the title. Use a hit's `traj_id` and summary when you later call
+`xskill generate` and want the instruction to name the evidence.
+
+When the team-server trajectory search lands, this same command will keep
+its argv; only the catalog behind it changes.
+
 ## Searching & sharing team skills
 
 ```bash
 xskill search <query...>       # search team skills; returns metadata only
+xskill search traj <query...>  # search trajectories (bundled mock catalog)
 xskill search <query...> --download  # legacy 10-slot LRU download + auto-install
 xskill download <skill-id>     # persist one result; interactively select harnesses
 xskill download <skill-id> --agent claude-code --agent codex -y  # for agents/scripts

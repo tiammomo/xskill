@@ -1159,13 +1159,54 @@ def cmd_search_hub(args, http=None, headers=None) -> int:
     return 0
 
 
+def cmd_search_traj(args) -> int:
+    """`xskill search traj <query>` —— 检索轨迹（当前读捆绑 mock 目录）。"""
+    import json as _json
+
+    from xskill.traj_search import search_trajectories
+
+    query = " ".join(args.terms[1:]).strip()
+    if not query:
+        _write_search_output(
+            "error: 用法 xskill search traj <query>",
+            to_stderr=True,
+        )
+        return 2
+    if getattr(args, "download", False):
+        _write_search_output(
+            "warning: --download 只对 skill 搜索有效，轨迹检索忽略",
+            to_stderr=True,
+        )
+    hits = search_trajectories(query, top_k=args.top_k)
+    if args.json:
+        _write_search_output(_json.dumps(hits, ensure_ascii=True, indent=2))
+        return 0
+    if not hits:
+        _write_search_output(f"mock traj 无匹配：{query}")
+        return 0
+    _write_search_output(
+        f"mock traj search  query={query!r}  {len(hits)} hits"
+    )
+    for hit in hits:
+        _write_search_output(
+            f"{hit['score']:.3f}\t{hit['status']}\t{hit['skill_used']}\t"
+            f"{hit['ecosystem']}\t{hit['traj_id']}"
+        )
+        title = hit.get("title") or ""
+        if title:
+            _write_search_output(f"  {title}")
+    return 0
+
+
 def cmd_search(args) -> int:
     """`xskill search` 部署模式自适应入口（#201）。
 
-    解析顺序：``--team`` / ``--local`` 显式覆盖 > team client 状态文件
-    （已 connect → SkillHub 路径）> 本地技能库路径。standalone 用户不再
-    被 "未连接 team server" 直接挡在门外（#46 的前向修复）。
+    首词为 ``traj`` 时走轨迹检索（当前为捆绑 mock 目录）。其余词走 skill
+    搜索：``--team`` / ``--local`` 显式覆盖 > team client 状态文件
+    （已 connect → SkillHub 路径）> 本地技能库路径。
     """
+    if args.terms and args.terms[0] == "traj":
+        return cmd_search_traj(args)
     if getattr(args, "team", False):
         return cmd_search_hub(args)
     if getattr(args, "local", False):
@@ -2058,11 +2099,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_search = sub.add_parser(
         "search",
-        help="搜索 skill（自动适配：已连 team 走 SkillHub，否则本地技能库）",
+        help="搜索 skill，或 `search traj <query>` 检索轨迹（当前为 mock 目录）",
     )
     p_search.add_argument(
         "terms", nargs="+", metavar="QUERY",
-        help="搜索词（可多个，拼成一个查询）",
+        help="搜索词。首词为 traj 时其余词检索轨迹；否则拼成 skill 查询",
     )
     p_search.add_argument("--top-k", "-k", type=int, default=5,
                           help="返回条数（skillhub 搜索最多 10）")
