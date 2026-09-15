@@ -729,8 +729,12 @@ async def api_unregister_dir(req: dict):
 
 
 @router.get("/trajectories/logs")
-async def api_trajectory_logs(filename: str, dir: str = ""):
-    """Return stored process logs for a trajectory."""
+def api_trajectory_logs(filename: str, dir: str = ""):
+    """Return stored process logs for a trajectory.
+
+    Defined sync so Starlette runs the blocking registry reads in its thread
+    pool; on the event loop they park the whole panel behind SQLite.
+    """
     from xskill.pipeline.registry import list_watch_dirs, pooled_connection
     import json as _json
 
@@ -754,8 +758,11 @@ async def api_trajectory_logs(filename: str, dir: str = ""):
 
 
 @router.get("/trajectories/list")
-async def api_list_trajectories():
-    """List all trajectories across registered directories with full status."""
+def api_list_trajectories():
+    """List all trajectories across registered directories with full status.
+
+    Sync for the same reason as ``api_trajectory_logs``.
+    """
     from xskill.pipeline.registry import list_watch_dirs, pooled_connection, get_status_counts
     dirs = list_watch_dirs()
     all_trajs = []
