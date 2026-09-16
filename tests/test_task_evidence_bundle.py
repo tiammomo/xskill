@@ -461,9 +461,9 @@ def test_projection_emits_changed_task_bundle_once_and_fences_stale_ack(tmp_path
     current = list_pending_task_evidence(db_path=db_path)
     assert len(current) == 1
     assert current[0]["generation"] == 2
-    assert current[0]["task_evidence_fingerprint"] != first[0][
-        "task_evidence_fingerprint"
-    ]
+    assert (
+        current[0]["task_evidence_fingerprint"] != first[0]["task_evidence_fingerprint"]
+    )
 
     assert acknowledge_task_evidence(first, db_path=db_path) == 0
     assert len(list_pending_task_evidence(db_path=db_path)) == 1
@@ -550,3 +550,39 @@ def test_projection_cleanup_is_not_limited_by_sql_parameter_count(tmp_path):
             "SELECT task_id FROM task_evidence_feed"
         ).fetchall()
     assert [row[0] for row in remaining] == ["task-0000"]
+
+
+def test_historical_stale_range_does_not_reject_live_attempt_or_change_fingerprint():
+    generation = _generation()
+    expected = build_task_evidence_bundle(generation, "task-a")
+    attempt = generation.attempts[0]
+    historical = replace(
+        attempt.evidence_ranges[0], evidence_id="historical-evidence-a", stale=True
+    )
+    with_history = replace(
+        attempt, evidence_ranges=(*attempt.evidence_ranges, historical)
+    )
+    generation_with_history = replace(
+        generation, attempts=(with_history, *generation.attempts[1:])
+    )
+    bundle = build_task_evidence_bundle(generation_with_history, "task-a")
+    assert bundle.task_evidence_fingerprint == expected.task_evidence_fingerprint
+    assert all(not e.stale for a in bundle.attempts for e in a.evidence_ranges)
+    assert len(generation_with_history.attempts[0].evidence_ranges) == 2
+    assert generation_with_history.attempts[0].evidence_ranges[-1].stale
+
+
+def test_historical_ranges_still_count_toward_input_bounds():
+    generation = _generation()
+    attempt = generation.attempts[0]
+    historical = replace(
+        attempt.evidence_ranges[0], evidence_id="historical-evidence-a", stale=True
+    )
+    with_history = replace(
+        attempt, evidence_ranges=(*attempt.evidence_ranges, historical)
+    )
+    changed = replace(generation, attempts=(with_history, *generation.attempts[1:]))
+    with pytest.raises(TaskEvidenceBundleError, match="evidence_ranges exceeds bound"):
+        build_task_evidence_bundle(
+            changed, "task-a", limits=TaskEvidenceLimits(evidence_ranges=2)
+        )
