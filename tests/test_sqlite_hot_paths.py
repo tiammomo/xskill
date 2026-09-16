@@ -148,27 +148,54 @@ class _FakeConnectionOperation:
             self._probe.leave()
 
 
-def test_close_cannot_overlap_fetch_or_connect():
-    """Connection close is isolated while fetch and connect may overlap."""
+def test_close_cannot_overlap_an_active_call():
+    """Connection close is isolated from any other SQLite call."""
     from xskill._sqlite_connect import connect_with_lock
 
     probe = _ConcurrencyProbe()
-    barrier = threading.Barrier(3)
+    barrier = threading.Barrier(2)
     fetch_raw = _FakeConnectionOperation(probe)
     close_raw = _FakeConnectionOperation(probe)
     fetch_conn = connect_with_lock(lambda **_kwargs: fetch_raw)
     close_conn = connect_with_lock(lambda **_kwargs: close_raw)
     cursor = fetch_conn.execute("SELECT 1")
 
-    def fetch_during_operations():
+    def fetch_during_close():
         barrier.wait(timeout=10)
         return cursor.fetchone()
 
-    def close_during_operations():
+    def close_during_fetch():
         barrier.wait(timeout=10)
         return close_conn.close()
 
-    def connect_during_operations():
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        fetch_future = executor.submit(fetch_during_close)
+        close_future = executor.submit(close_during_fetch)
+        assert fetch_future.result(timeout=10) == (1,)
+        close_future.result(timeout=10)
+
+    assert close_raw.closed.is_set()
+    assert probe.max_active == 1
+    # Do not leave proxy finalizers to affect a later concurrency assertion.
+    cursor.close()
+    fetch_conn.close()
+
+
+def test_fetch_and_connect_overlap_while_no_close_waits():
+    """Ordinary SQL work stays concurrent; only finalization serializes it."""
+    from xskill._sqlite_connect import connect_with_lock
+
+    probe = _ConcurrencyProbe()
+    barrier = threading.Barrier(2)
+    fetch_raw = _FakeConnectionOperation(probe)
+    fetch_conn = connect_with_lock(lambda **_kwargs: fetch_raw)
+    cursor = fetch_conn.execute("SELECT 1")
+
+    def fetch_during_connect():
+        barrier.wait(timeout=10)
+        return cursor.fetchone()
+
+    def connect_during_fetch():
         barrier.wait(timeout=10)
 
         def slow_connect(**_kwargs):
@@ -181,16 +208,13 @@ def test_close_cannot_overlap_fetch_or_connect():
 
         return connect_with_lock(slow_connect)
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        fetch_future = executor.submit(fetch_during_operations)
-        close_future = executor.submit(close_during_operations)
-        connect_future = executor.submit(connect_during_operations)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        fetch_future = executor.submit(fetch_during_connect)
+        connect_future = executor.submit(connect_during_fetch)
         assert fetch_future.result(timeout=10) == (1,)
-        close_future.result(timeout=10)
         connected = connect_future.result(timeout=10)
 
     assert probe.max_active == 2
-    # Do not leave proxy finalizers to affect a later concurrency assertion.
     cursor.close()
     fetch_conn.close()
     connected.close()

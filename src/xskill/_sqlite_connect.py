@@ -38,6 +38,13 @@ class _SQLiteCallGate:
     SQL writer waiting on another transaction could prevent that transaction
     from releasing its database lock.  A recursive SQLite callback may also
     re-enter the shared side on its current thread.
+
+    Waiting finalization holds new SQL calls back, so a steadily busy process
+    cannot starve it, while calls that already hold the shared side keep their
+    re-entry rights and cannot deadlock against the finalization they precede.
+    Calls on a connection inside an open transaction pass a waiting finalization
+    too: it already holds database locks, and holding it back would keep those
+    locks from the running SQL call the finalization is itself waiting for.
     """
 
     def __init__(self) -> None:
@@ -46,8 +53,11 @@ class _SQLiteCallGate:
         self._reader_depth: dict[int, int] = {}
         self._writer_thread: int | None = None
         self._writer_depth = 0
+        self._finalizers_waiting = 0
 
-    def enter(self, *, exclusive: bool) -> None:
+    def enter(
+        self, *, exclusive: bool, holds_database_lock: bool = False,
+    ) -> None:
         thread_id = threading.get_ident()
         with self._condition:
             if exclusive:
@@ -58,18 +68,29 @@ class _SQLiteCallGate:
                     raise RuntimeError(
                         "cannot finalize SQLite from inside an active SQL call"
                     )
-                while self._writer_thread is not None or self._readers:
-                    self._condition.wait()
+                self._finalizers_waiting += 1
+                try:
+                    while self._writer_thread is not None or self._readers:
+                        self._condition.wait()
+                except BaseException:
+                    self._finalizers_waiting -= 1
+                    self._condition.notify_all()
+                    raise
+                self._finalizers_waiting -= 1
                 self._writer_thread = thread_id
                 self._writer_depth = 1
                 return
 
-            while self._writer_thread is not None:
-                self._condition.wait()
+            reader_depth = self._reader_depth.get(thread_id, 0)
+            # Finalization runs SQLite teardown that can re-enter this side on
+            # its own thread; both re-entries own the gate already.
+            if not reader_depth and self._writer_thread != thread_id:
+                while self._writer_thread is not None or (
+                    self._finalizers_waiting and not holds_database_lock
+                ):
+                    self._condition.wait()
             self._readers += 1
-            self._reader_depth[thread_id] = (
-                self._reader_depth.get(thread_id, 0) + 1
-            )
+            self._reader_depth[thread_id] = reader_depth + 1
 
     def leave(self, *, exclusive: bool) -> None:
         thread_id = threading.get_ident()
@@ -219,11 +240,22 @@ class _LockedConnection(sqlite3.Connection):
         super().__init__(*args, **kwargs)
         self._sqlite_closed = False
 
+    def _sqlite_in_transaction(self) -> bool:
+        try:
+            return bool(
+                sqlite3.Connection.in_transaction.__get__(self, type(self))
+            )
+        except Exception:  # pragma: no cover - closed or half-built handle
+            return False
+
     def _sqlite_call(
         self, operation: Callable[[], Any], *, exclusive: bool = False,
     ) -> Any:
         """Run one SQLite call under the shared or lifecycle-exclusive gate."""
-        _SQLITE_CALL_GATE.enter(exclusive=exclusive)
+        _SQLITE_CALL_GATE.enter(
+            exclusive=exclusive,
+            holds_database_lock=not exclusive and self._sqlite_in_transaction(),
+        )
         try:
             return operation()
         finally:
@@ -463,6 +495,16 @@ if _pysqlite3 is not None:
             super().__init__(*args, **kwargs)
             self._sqlite_closed = False
 
+        def _sqlite_in_transaction(self) -> bool:
+            try:
+                return bool(
+                    _pysqlite3.Connection.in_transaction.__get__(
+                        self, type(self),
+                    )
+                )
+            except Exception:  # pragma: no cover - closed or half-built handle
+                return False
+
         def cursor(self, *args: Any, **kwargs: Any):
             factory = kwargs.pop("factory", _PysqliteLockedCursor)
             return self._sqlite_call(
@@ -637,10 +679,19 @@ class _SerializedConnection:
         object.__setattr__(self, "_connection", connection)
         object.__setattr__(self, "_sqlite_closed", False)
 
+    def _sqlite_in_transaction(self) -> bool:
+        try:
+            return bool(getattr(self._connection, "in_transaction", False))
+        except Exception:  # pragma: no cover - wrapper without the attribute
+            return False
+
     def _sqlite_call(
         self, operation: Callable[[], Any], *, exclusive: bool = False,
     ) -> Any:
-        _SQLITE_CALL_GATE.enter(exclusive=exclusive)
+        _SQLITE_CALL_GATE.enter(
+            exclusive=exclusive,
+            holds_database_lock=not exclusive and self._sqlite_in_transaction(),
+        )
         try:
             return operation()
         finally:
