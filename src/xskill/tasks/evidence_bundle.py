@@ -15,6 +15,7 @@ from typing import Any, TypeVar
 
 from xskill.tasks.models import (
     AttemptRelation,
+    EvidenceRange,
     LogicalTask,
     TaskAtomMembership,
     TaskAttempt,
@@ -363,6 +364,13 @@ class TaskEvidenceBundle:
         return bundle
 
 
+def _live_evidence_ranges(attempt: TaskAttempt) -> tuple[EvidenceRange, ...]:
+    """Keep audit history in Task Graph, not in the current learning view."""
+    live = tuple(item for item in attempt.evidence_ranges if not item.stale)
+    _ensure(bool(live), "stale EvidenceRange leaves Attempt without live evidence")
+    return live
+
+
 def build_task_evidence_bundle(
     generation: TaskGraphGeneration,
     task_id: str,
@@ -433,7 +441,7 @@ def build_task_evidence_bundle(
             replace(
                 item,
                 evidence_ranges=_ordered(
-                    item.evidence_ranges,
+                    _live_evidence_ranges(item),
                     lambda evidence: evidence.evidence_id,
                 ),
             )

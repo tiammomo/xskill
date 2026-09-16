@@ -335,3 +335,39 @@ def test_bundle_serialized_size_is_bounded():
             replace(generation, tasks=(oversized_task,)),
             "task-a",
         )
+
+
+def test_historical_stale_range_does_not_reject_live_attempt_or_change_fingerprint():
+    generation = _generation()
+    expected = build_task_evidence_bundle(generation, "task-a")
+    attempt = generation.attempts[0]
+    historical = replace(
+        attempt.evidence_ranges[0], evidence_id="historical-evidence-a", stale=True
+    )
+    with_history = replace(
+        attempt, evidence_ranges=(*attempt.evidence_ranges, historical)
+    )
+    generation_with_history = replace(
+        generation, attempts=(with_history, *generation.attempts[1:])
+    )
+    bundle = build_task_evidence_bundle(generation_with_history, "task-a")
+    assert bundle.task_evidence_fingerprint == expected.task_evidence_fingerprint
+    assert all(not e.stale for a in bundle.attempts for e in a.evidence_ranges)
+    assert len(generation_with_history.attempts[0].evidence_ranges) == 2
+    assert generation_with_history.attempts[0].evidence_ranges[-1].stale
+
+
+def test_historical_ranges_still_count_toward_input_bounds():
+    generation = _generation()
+    attempt = generation.attempts[0]
+    historical = replace(
+        attempt.evidence_ranges[0], evidence_id="historical-evidence-a", stale=True
+    )
+    with_history = replace(
+        attempt, evidence_ranges=(*attempt.evidence_ranges, historical)
+    )
+    changed = replace(generation, attempts=(with_history, *generation.attempts[1:]))
+    with pytest.raises(TaskEvidenceBundleError, match="evidence_ranges exceeds bound"):
+        build_task_evidence_bundle(
+            changed, "task-a", limits=TaskEvidenceLimits(evidence_ranges=2)
+        )
