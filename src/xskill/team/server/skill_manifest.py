@@ -247,6 +247,7 @@ def _resolve_slot(
     user_key: str = "",
     fill_need: int = 5,
     db_path: Path | str | None = None,
+    canary_enabled: bool = True,
 ) -> SkillSlot | None:
     """对一个 skill 现算它对该 client 的 side + sha。"""
     if isinstance(skill, dict) and skill.get("source") == "skillhub":
@@ -269,7 +270,7 @@ def _resolve_slot(
         refs[skill.name] if refs is not None else
         (main_sha(skill.path) or "", staging_sha(skill.path))
     )
-    if cached_staging:
+    if cached_staging and canary_enabled:
         from xskill.pipeline.registry import is_auto_canary_user
         origin_db = Path(db_path) if db_path else None
         if user_key and is_auto_canary_user(
@@ -321,6 +322,7 @@ def build_manifest(
     user_key: str = "",
     fill_need: int | None = None,
     db_path: Path | str | None = None,
+    canary_enabled: bool = True,
 ) -> SyncResponse:
     """为 ``client_id`` 现算 manifest。skill 总数不足 total_slots 时全发。
 
@@ -401,6 +403,7 @@ def build_manifest(
         slot = _resolve_slot(
             skill, client_id, probability, bucket, refs=catalog.refs,
             user_key=user_key, fill_need=need, db_path=origin_db,
+            canary_enabled=canary_enabled,
         )
         if slot is not None:
             ov = side_overrides.get(slot.skill_name)
