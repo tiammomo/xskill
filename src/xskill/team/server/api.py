@@ -840,6 +840,11 @@ def team_sync(
         except Exception:  # pylint: disable=broad-exception-caught
             logger.warning("skill prefs lookup failed, serving without control-plane",
                            exc_info=True)
+        from xskill.api import app as app_mod
+        from xskill.canary import CanaryConfig
+        canary_enabled = CanaryConfig.from_dict(
+            (app_mod._config or {}).get("canary") or {}  # pylint: disable=protected-access
+        ).enabled
         resp = build_manifest(
             client_id=client_id,
             skill_dir=_ctx.skill_dir,
@@ -851,6 +856,7 @@ def team_sync(
             retired=retired,
             telemetry_submit=telemetry_submit,
             user_key=user_key,
+            canary_enabled=canary_enabled,
         )
         resp.server_slots = total_slots
         # client 截取安装数：默认=服务器 skill_slots；看板可改 user_client_settings

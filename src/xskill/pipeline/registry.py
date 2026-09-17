@@ -781,8 +781,8 @@ def pooled_connection(db_path: Optional[Path] = None) -> Iterator[sqlite3.Connec
     """线程内复用的 registry 连接；退出时回滚未提交事务，但不 close。
 
     高频调用点（``record_usage`` 每次 LLM/embedding 调用一次）每次 open/close
-    会把连接 finalize 打成热事件，而 finalize 走 ``_SQLITE_CALL_GATE`` 独占侧，
-    高负载下整个进程的 SQLite 调用都会 park 在这把门后（futex convoy）。线程内
+    会把连接 finalize 打成热事件，而 finalize 走连接自己那把门的独占侧，
+    高负载下该连接上的调用都会 park 在这把门后（futex convoy）。线程内
     复用后 finalize 只发生在线程退出 / DB 重建 / 槽位淘汰这些低频时刻。
 
     同线程重入（外层还没退出又请求同一 DB）退回一次性连接，保证两层事务互不
@@ -1545,15 +1545,14 @@ def auto_canary_users_by_skill(
 ) -> dict[str, set[str]]:
     """短 TTL 缓存：每个 skill 的自动灰度对象集合。"""
     key = _auto_canary_cache_key(db_path)
-    now = time.monotonic()
+    # 重建在锁内进行：过期瞬间只有一个线程重建，其余线程等它的结果
     with _auto_canary_cache_lock:
+        now = time.monotonic()
         hit = _auto_canary_cache.get(key)
-        if hit is not None and now - hit[0] < _AUTO_CANARY_TTL_SEC:
-            return {name: set(users) for name, users in hit[1].items()}
-    built = _build_auto_canary_users(db_path)
-    with _auto_canary_cache_lock:
-        _auto_canary_cache[key] = (now, built)
-    return {name: set(users) for name, users in built.items()}
+        if hit is None or now - hit[0] >= _AUTO_CANARY_TTL_SEC:
+            hit = (now, _build_auto_canary_users(db_path))
+            _auto_canary_cache[key] = hit
+        return {name: set(users) for name, users in hit[1].items()}
 
 
 def auto_canary_users(skill_name: str, *,
@@ -2436,41 +2435,32 @@ def unregister_dir(dir_path: str | Path, *, db_path: Optional[Path] = None) -> b
     分母被删小，比率虚高（审计 P1-7）。
     """
     dir_path = str(Path(dir_path).resolve())
+    trajectory_stem_sql = (
+        "CASE WHEN substr(t.filename,-3)='.md'"
+        " THEN substr(t.filename,1,length(t.filename)-3) ELSE t.filename END"
+    )
     with pooled_connection(db_path) as conn:
-        source_rows = conn.execute(
-            "SELECT t.watch_dir_id,t.filename,w.source_scope_id"
-            " FROM trajectories t JOIN watch_dirs w ON t.watch_dir_id=w.id"
-            " WHERE w.path=?",
+        conn.execute(
+            "DELETE FROM atom_adoption WHERE EXISTS ("
+            " SELECT 1 FROM trajectories t JOIN watch_dirs w ON t.watch_dir_id=w.id"
+            f" WHERE w.path=? AND atom_adoption.atom_id GLOB 'atom_' || {trajectory_stem_sql} || '_*')",
             (dir_path,),
-        ).fetchall()
-        for source_row in source_rows:
-            stem = (
-                source_row["filename"][:-3]
-                if source_row["filename"].endswith(".md")
-                else source_row["filename"]
-            )
-            conn.execute("DELETE FROM atom_adoption WHERE atom_id GLOB ?",
-                         (f"atom_{stem}_*",))
-            state = conn.execute(
-                "SELECT tenant_id,task_scope_id FROM task_graph_source_state"
-                " WHERE source_scope_id=? AND traj_id=?",
-                (source_row["source_scope_id"], stem),
-            ).fetchone()
-            if state is not None:
-                conn.execute(
-                    "INSERT INTO task_graph_dirty_sources("
-                    "watch_dir_id,filename,source_scope_id,tenant_id,task_scope_id,"
-                    "deleted,generation,reason,marked_at)"
-                    " VALUES(?,?,?,?,?,1,1,'watch_dir_removed',datetime('now'))"
-                    " ON CONFLICT(watch_dir_id,filename) DO UPDATE SET"
-                    " deleted=1,generation=generation+1,reason='watch_dir_removed',"
-                    " marked_at=datetime('now')",
-                    (
-                        source_row["watch_dir_id"], source_row["filename"],
-                        source_row["source_scope_id"], state["tenant_id"],
-                        state["task_scope_id"],
-                    ),
-                )
+        )
+        conn.execute(
+            "INSERT INTO task_graph_dirty_sources("
+            "watch_dir_id,filename,source_scope_id,tenant_id,task_scope_id,"
+            "deleted,generation,reason,marked_at)"
+            " SELECT t.watch_dir_id,t.filename,w.source_scope_id,"
+            " s.tenant_id,s.task_scope_id,1,1,'watch_dir_removed',datetime('now')"
+            " FROM trajectories t JOIN watch_dirs w ON t.watch_dir_id=w.id"
+            " JOIN task_graph_source_state s ON s.source_scope_id=w.source_scope_id"
+            f" AND s.traj_id={trajectory_stem_sql}"
+            " WHERE w.path=?"
+            " ON CONFLICT(watch_dir_id,filename) DO UPDATE SET"
+            " deleted=1,generation=generation+1,reason='watch_dir_removed',"
+            " marked_at=datetime('now')",
+            (dir_path,),
+        )
         cur = conn.execute("DELETE FROM watch_dirs WHERE path=?", (dir_path,))
         conn.commit()
         return cur.rowcount > 0
@@ -2568,17 +2558,17 @@ def discover_trajectories(
             ).fetchall()
         }
 
+        # 文件系统扫描（stat / sidecar 读取）全部在开写事务之前完成
+        insert_rows: list[tuple] = []
+        mtime_only_rows: list[tuple] = []
+        updated_rows: list[tuple] = []
         for md in sorted(dir_path.glob("traj_*.md")):
             if md.name.endswith(".meta"):
                 continue
             mtime = md.stat().st_mtime
             row = existing.get(md.name)
             if row is None:
-                conn.execute(
-                    "INSERT INTO trajectories"
-                    " (watch_dir_id, filename, file_mtime, source_model,"
-                    "  source_harness, user_key, discovered_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+                insert_rows.append(
                     (watch_dir_id, md.name, mtime, _sidecar_model(md),
                      _sidecar_field(md, "harness"), user_key),
                 )
@@ -2595,32 +2585,37 @@ def discover_trajectories(
             if status == "discovered":
                 # 还没开拆,后续 split 会读到最新内容（last_offset=0 全量拆）。
                 # 只更 mtime,不必翻 updated。
-                conn.execute(
-                    "UPDATE trajectories SET file_mtime=?"
-                    " WHERE watch_dir_id=? AND filename=?",
-                    (mtime, watch_dir_id, md.name),
-                )
+                mtime_only_rows.append((mtime, watch_dir_id, md.name))
                 continue
             if (
                 status == TrajectoryStatus.FILTERED.value
                 and row["process_action"] == ProcessAction.NOT_FIT.value
             ):
                 # Interest-filtered trajectories re-enter only after interests change.
-                conn.execute(
-                    "UPDATE trajectories SET file_mtime=?"
-                    " WHERE watch_dir_id=? AND filename=?",
-                    (mtime, watch_dir_id, md.name),
-                )
+                mtime_only_rows.append((mtime, watch_dir_id, md.name))
                 continue
             # 已落定（done/indexed/split_done/error/filtered/updated）+ 内容变更
             # → 翻 updated,等下一轮重新 split（续接点续拆）。
-            conn.execute(
-                "UPDATE trajectories SET status='updated', file_mtime=?,"
-                " updated_at=datetime('now')"
-                " WHERE watch_dir_id=? AND filename=?",
-                (mtime, watch_dir_id, md.name),
-            )
+            updated_rows.append((mtime, watch_dir_id, md.name))
 
+        conn.executemany(
+            "INSERT INTO trajectories"
+            " (watch_dir_id, filename, file_mtime, source_model,"
+            "  source_harness, user_key, discovered_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+            insert_rows,
+        )
+        conn.executemany(
+            "UPDATE trajectories SET file_mtime=?"
+            " WHERE watch_dir_id=? AND filename=?",
+            mtime_only_rows,
+        )
+        conn.executemany(
+            "UPDATE trajectories SET status='updated', file_mtime=?,"
+            " updated_at=datetime('now')"
+            " WHERE watch_dir_id=? AND filename=?",
+            updated_rows,
+        )
         conn.commit()
         return new_files
 
@@ -2957,29 +2952,26 @@ def reset_not_fit_for_interest_change(
         profile_store_roots: set[str] = set()
         trajectories_by_directory: dict[str, set[str]] = {}
         for row in rows:
-            conn.execute(
-                "UPDATE trajectories SET status=?, process_action=NULL, "
-                "error_msg=NULL, interest_fingerprint=NULL, last_offset=0, "
-                "last_atom_id=NULL, tasks_extracted=0, has_meta=0, "
-                "has_embedding=0, indexed_at=NULL, updated_at=datetime('now') "
-                "WHERE id=?",
-                (TrajectoryStatus.DISCOVERED.value, row["id"]),
-            )
             trajectory_stem = (
                 row["filename"][:-3]
                 if row["filename"].endswith(".md")
                 else row["filename"]
             )
-            tasks_directory = Path(row["path"]) / trajectory_stem / "tasks"
-            if tasks_directory.is_dir():
-                for atom_file in tasks_directory.glob("atom_*.json"):
-                    atom_file.unlink()
             directories_seen.add(row["path"])
             if row["user_key"]:
                 profile_store_roots.add(row["path"])
             trajectories_by_directory.setdefault(row["path"], set()).add(
                 trajectory_stem,
             )
+        # 写事务内只跑 SQL；atom 文件在 commit 之后再删
+        conn.executemany(
+            "UPDATE trajectories SET status=?, process_action=NULL, "
+            "error_msg=NULL, interest_fingerprint=NULL, last_offset=0, "
+            "last_atom_id=NULL, tasks_extracted=0, has_meta=0, "
+            "has_embedding=0, indexed_at=NULL, updated_at=datetime('now') "
+            "WHERE id=?",
+            [(TrajectoryStatus.DISCOVERED.value, row["id"]) for row in rows],
+        )
         if profile_store_roots:
             from xskill.recommend.profile_dirty import (
                 mark_profile_dirty_on_connection,
@@ -2992,6 +2984,12 @@ def reset_not_fit_for_interest_change(
                     reason="atom_reset",
                 )
         conn.commit()
+        for directory_path, trajectory_ids in trajectories_by_directory.items():
+            for trajectory_stem in trajectory_ids:
+                tasks_directory = Path(directory_path) / trajectory_stem / "tasks"
+                if tasks_directory.is_dir():
+                    for atom_file in tasks_directory.glob("atom_*.json"):
+                        atom_file.unlink()
         from xskill.pipeline.atom import AtomTaskStore
         for directory_path, trajectory_ids in trajectories_by_directory.items():
             AtomTaskStore(Path(directory_path)).remove_locations_for_trajs(
@@ -3049,52 +3047,22 @@ def reset_trajectories(
         directories_seen: set[str] = set()
         profile_store_roots: set[str] = set()
         trajectories_by_directory: dict[str, set[str]] = {}
+        adoption_glob_rows: list[tuple] = []
+        dirty_source_rows: list[tuple] = []
         for trajectory_row in trajectory_rows:
-            conn.execute(
-                "UPDATE trajectories SET status='discovered', process_action=NULL, "
-                "error_msg=NULL, interest_fingerprint=NULL, last_offset=0, "
-                "last_atom_id=NULL, tasks_extracted=0, "
-                "has_meta=0, has_embedding=0, indexed_at=NULL, "
-                "skill_generated=NULL, skill_used=NULL, canary_side=NULL, "
-                "ux_score=NULL, "
-                "updated_at=datetime('now') WHERE id=?",
-                (trajectory_row["id"],),
-            )
             trajectory_stem = (
                 trajectory_row["filename"][:-3]
                 if trajectory_row["filename"].endswith(".md")
                 else trajectory_row["filename"]
             )
-            tasks_directory = Path(trajectory_row["path"]) / trajectory_stem / "tasks"
-            if tasks_directory.is_dir():
-                for atom_file in tasks_directory.glob("atom_*.json"):
-                    atom_file.unlink()
-            # atom 文件已删、tasks_extracted 已归零——采纳事件一并清，
-            # 否则采纳率分子留历史累计、分母归零后比率虚高（审计 P1-7）。
-            conn.execute("DELETE FROM atom_adoption WHERE atom_id GLOB ?",
-                         (f"atom_{trajectory_stem}_*",))
-            source_state = conn.execute(
-                "SELECT tenant_id,task_scope_id FROM task_graph_source_state"
-                " WHERE source_scope_id=? AND traj_id=?",
-                (trajectory_row["source_scope_id"], trajectory_stem),
-            ).fetchone()
-            if source_state is not None:
-                conn.execute(
-                    "INSERT INTO task_graph_dirty_sources("
-                    "watch_dir_id,filename,source_scope_id,tenant_id,task_scope_id,"
-                    "deleted,generation,reason,marked_at)"
-                    " VALUES(?,?,?,?,?,1,1,'atom_reset',datetime('now'))"
-                    " ON CONFLICT(watch_dir_id,filename) DO UPDATE SET"
-                    " deleted=1,generation=generation+1,reason='atom_reset',"
-                    " marked_at=datetime('now')",
-                    (
-                        trajectory_row["watch_dir_id"],
-                        trajectory_row["filename"],
-                        trajectory_row["source_scope_id"],
-                        source_state["tenant_id"],
-                        source_state["task_scope_id"],
-                    ),
-                )
+            adoption_glob_rows.append((f"atom_{trajectory_stem}_*",))
+            dirty_source_rows.append((
+                trajectory_row["watch_dir_id"],
+                trajectory_row["filename"],
+                trajectory_row["source_scope_id"],
+                trajectory_row["source_scope_id"],
+                trajectory_stem,
+            ))
             directories_seen.add(trajectory_row["path"])
             if trajectory_row["user_key"]:
                 profile_store_roots.add(trajectory_row["path"])
@@ -3102,6 +3070,33 @@ def reset_trajectories(
                 trajectory_row["path"],
                 set(),
             ).add(trajectory_stem)
+        # 写事务内只跑 SQL；atom 文件在 commit 之后再删
+        conn.executemany(
+            "UPDATE trajectories SET status='discovered', process_action=NULL, "
+            "error_msg=NULL, interest_fingerprint=NULL, last_offset=0, "
+            "last_atom_id=NULL, tasks_extracted=0, "
+            "has_meta=0, has_embedding=0, indexed_at=NULL, "
+            "skill_generated=NULL, skill_used=NULL, canary_side=NULL, "
+            "ux_score=NULL, "
+            "updated_at=datetime('now') WHERE id=?",
+            [(trajectory_row["id"],) for trajectory_row in trajectory_rows],
+        )
+        # tasks_extracted 已归零——采纳事件一并清，否则采纳率分子留历史累计（审计 P1-7）
+        conn.executemany(
+            "DELETE FROM atom_adoption WHERE atom_id GLOB ?",
+            adoption_glob_rows,
+        )
+        conn.executemany(
+            "INSERT INTO task_graph_dirty_sources("
+            "watch_dir_id,filename,source_scope_id,tenant_id,task_scope_id,"
+            "deleted,generation,reason,marked_at)"
+            " SELECT ?,?,?,tenant_id,task_scope_id,1,1,'atom_reset',datetime('now')"
+            " FROM task_graph_source_state WHERE source_scope_id=? AND traj_id=?"
+            " ON CONFLICT(watch_dir_id,filename) DO UPDATE SET"
+            " deleted=1,generation=generation+1,reason='atom_reset',"
+            " marked_at=datetime('now')",
+            dirty_source_rows,
+        )
         if profile_store_roots:
             from xskill.recommend.profile_dirty import (
                 mark_profile_dirty_on_connection,
@@ -3114,6 +3109,12 @@ def reset_trajectories(
                     reason="atom_reset",
                 )
         conn.commit()
+        for directory_path, trajectory_ids in trajectories_by_directory.items():
+            for trajectory_stem in trajectory_ids:
+                tasks_directory = Path(directory_path) / trajectory_stem / "tasks"
+                if tasks_directory.is_dir():
+                    for atom_file in tasks_directory.glob("atom_*.json"):
+                        atom_file.unlink()
         from xskill.pipeline.atom import AtomTaskStore
         for directory_path, trajectory_ids in trajectories_by_directory.items():
             AtomTaskStore(Path(directory_path)).remove_locations_for_trajs(

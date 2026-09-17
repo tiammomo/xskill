@@ -301,7 +301,7 @@ def api_search_trajectories(req: TrajectorySearchRequest):
 
 
 @router.get("/trajectories/content")
-async def api_trajectory_content(path: str):
+def api_trajectory_content(path: str):
     """Read trajectory file content. Also returns .meta if available."""
     p = Path(path)
     if not p.is_file():
@@ -576,7 +576,7 @@ def api_resolve_skill(req: SkillResolveRequest):
         cfg = canary.CanaryConfig.from_dict(canary_cfg_raw)
 
         side = "main"
-        if req.accept_staging and canary.has_staging(sd):
+        if req.accept_staging and cfg.enabled and canary.has_staging(sd):
             traj_id = f"resolve_{time.time_ns()}"
             side = canary.pick_side(traj_id, skill_name, cfg.probability)
 
@@ -693,7 +693,7 @@ async def api_canary_overview():
 # ---- Registry + Watcher --------------------------------------------------
 
 @router.get("/registry/dirs")
-async def api_list_registry_dirs():
+def api_list_registry_dirs():
     """List all registered watch directories with trajectory counts."""
     from xskill.pipeline.registry import list_watch_dirs
     dirs = list_watch_dirs()
@@ -701,7 +701,7 @@ async def api_list_registry_dirs():
 
 
 @router.post("/registry/dirs")
-async def api_register_dir(req: dict):
+def api_register_dir(req: dict):
     """Register a directory for watching."""
     from xskill.pipeline.registry import register_dir
     path = req.get("path", "")
@@ -716,7 +716,7 @@ async def api_register_dir(req: dict):
 
 
 @router.delete("/registry/dirs")
-async def api_unregister_dir(req: dict):
+def api_unregister_dir(req: dict):
     """Unregister a directory."""
     from xskill.pipeline.registry import unregister_dir
     path = req.get("path", "")

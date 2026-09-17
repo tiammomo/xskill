@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 
@@ -164,6 +166,44 @@ def test_staging_write_hook_immediately_enters_active_projection(tmp_path):
         root,
         db_path=registry,
     ) == ["new-canary"]
+
+
+def test_canary_reconcile_reads_git_refs_outside_write_transaction(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    root.mkdir()
+    registry = tmp_path / "registry.db"
+    _init_repo_for_catalog(root / "alpha")
+    _init_repo_for_catalog(root / "beta")
+    catalog_store.backfill_skills_catalog(root, db_path=registry)
+    (root / "alpha" / ".git" / "refs" / "heads" / "staging").write_text(
+        "c" * 40 + "\n",
+        encoding="ascii",
+    )
+    _init_repo_for_catalog(root / "gamma")
+
+    connections = []
+    original_pooled_connection = catalog_store.pooled_connection
+
+    @contextmanager
+    def tracking_pooled_connection(db_path):
+        with original_pooled_connection(db_path) as connection:
+            connections.append(connection)
+            yield connection
+
+    original_read_text = Path.read_text
+
+    def read_text_outside_transaction(self, *args, **kwargs):
+        assert not any(connection.in_transaction for connection in connections)
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(catalog_store, "pooled_connection", tracking_pooled_connection)
+    monkeypatch.setattr(Path, "read_text", read_text_outside_transaction)
+
+    assert catalog_store.reconcile_native_canary_catalog(root, db_path=registry) == 1
+    assert connections
+    assert catalog_store.list_active_native_canaries(root, db_path=registry) == ["alpha"]
+    rows = catalog_store.list_native_cluster_catalog(root, db_path=registry)
+    assert sorted(row["name"] for row in rows) == ["alpha", "beta", "gamma"]
 
 
 def test_candidates_notify_uses_count_not_reread(tmp_path, monkeypatch):

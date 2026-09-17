@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,7 @@ from xskill.pipeline.registry import (
     increment_retry,
     mark_not_fit,
     reset_not_fit_for_interest_change,
+    reset_trajectories,
 )
 
 
@@ -626,3 +628,180 @@ def test_get_trajs_by_status_error_retry_filter(tmp_path, db_path):
     assert get_trajs_by_status(
         wid, "error", max_retries=4, db_path=db_path,
     ) == ["traj_err.md"]
+
+
+# ---- Write-lock hygiene: only SQL while a write transaction is open ----
+
+class _TransactionObserver:
+    """Proxy a real connection and count statements issued inside a write txn."""
+
+    def __init__(self, wrapped):
+        self.wrapped = wrapped
+        self.statements_in_transaction = 0
+
+    def __getattr__(self, name):
+        return getattr(self.wrapped, name)
+
+    def execute(self, *args, **kwargs):
+        cursor = self.wrapped.execute(*args, **kwargs)
+        if self.wrapped.in_transaction:
+            self.statements_in_transaction += 1
+        return cursor
+
+    def executemany(self, *args, **kwargs):
+        cursor = self.wrapped.executemany(*args, **kwargs)
+        if self.wrapped.in_transaction:
+            self.statements_in_transaction += 1
+        return cursor
+
+
+def _observe_registry_transactions(monkeypatch, db_path):
+    observer = _TransactionObserver(get_connection(db_path))
+
+    @contextmanager
+    def observed_pool(_db_path):
+        yield observer
+
+    monkeypatch.setattr("xskill.pipeline.registry.pooled_connection", observed_pool)
+    for method_name in ("unlink", "glob", "stat", "read_text", "is_dir", "is_file"):
+        original_method = getattr(Path, method_name)
+
+        def guarded_method(self, *args, _original=original_method, **kwargs):
+            assert not observer.wrapped.in_transaction, (
+                f"Path.{_original.__name__} called while write txn open"
+            )
+            return _original(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, method_name, guarded_method)
+    return observer
+
+
+def _seed_source_state(db_path, wid, trajectory_stem):
+    conn = get_connection(db_path)
+    source_scope_id = conn.execute(
+        "SELECT source_scope_id FROM watch_dirs WHERE id=?", (wid,),
+    ).fetchone()["source_scope_id"]
+    conn.execute(
+        "INSERT INTO task_graph_source_state(tenant_id,task_scope_id,"
+        "source_scope_id,watch_dir_id,traj_id,source_revision,generation_id)"
+        " VALUES('tenant-a','scope-a',?,?,?,'rev1','gen1')",
+        (source_scope_id, wid, trajectory_stem),
+    )
+    conn.commit()
+    conn.close()
+
+
+class TestWriteLockHygiene:
+    def test_discover_reads_filesystem_before_writing(
+        self, traj_dir, db_path, monkeypatch,
+    ):
+        wid = register_dir(traj_dir, db_path=db_path)
+        (traj_dir / "traj_0001.json").write_text(
+            '{"model": "m1", "harness": "codex"}', encoding="utf-8",
+        )
+        observer = _observe_registry_transactions(monkeypatch, db_path)
+
+        new_files = discover_trajectories(wid, traj_dir, db_path=db_path)
+
+        assert new_files == ["traj_0001.md", "traj_0002.md"]
+        assert observer.statements_in_transaction == 3
+        row = observer.wrapped.execute(
+            "SELECT source_model, source_harness FROM trajectories"
+            " WHERE filename='traj_0001.md'",
+        ).fetchone()
+        assert (row["source_model"], row["source_harness"]) == ("m1", "codex")
+
+    def test_reset_not_fit_unlinks_atoms_after_commit(
+        self, traj_dir, db_path, monkeypatch,
+    ):
+        wid = register_dir(traj_dir, db_path=db_path)
+        discover_trajectories(wid, traj_dir, db_path=db_path)
+        mark_not_fit(wid, "traj_0001.md", "not infra", "old", db_path=db_path)
+        mark_not_fit(wid, "traj_0002.md", "not infra", "old", db_path=db_path)
+        tasks_directory = traj_dir / "traj_0001" / "tasks"
+        tasks_directory.mkdir(parents=True)
+        (tasks_directory / "atom_traj_0001_0001.json").write_text("{}")
+        observer = _observe_registry_transactions(monkeypatch, db_path)
+
+        reset_count = reset_not_fit_for_interest_change(
+            old_interest_fingerprint="old",
+            new_interest_fingerprint="new",
+            db_path=db_path,
+        )
+
+        assert reset_count == 2
+        assert observer.statements_in_transaction == 1
+        assert not list(tasks_directory.glob("atom_*.json"))
+        assert set(get_trajs_by_status(wid, "discovered", db_path=db_path)) == {
+            "traj_0001.md", "traj_0002.md",
+        }
+
+    def test_reset_trajectories_bounded_statements(
+        self, traj_dir, db_path, monkeypatch,
+    ):
+        wid = register_dir(traj_dir, db_path=db_path)
+        discover_trajectories(wid, traj_dir, db_path=db_path)
+        update_traj_status(wid, "traj_0001.md", "done", db_path=db_path)
+        update_traj_status(wid, "traj_0002.md", "done", db_path=db_path)
+        _seed_source_state(db_path, wid, "traj_0001")
+        conn = get_connection(db_path)
+        conn.execute(
+            "INSERT INTO atom_adoption(atom_id, skill, weightscore, was_new)"
+            " VALUES('atom_traj_0001_0001','s',1,1),('atom_traj_0002_0001','s',1,1),"
+            "('atom_traj_9999_0001','s',1,1)",
+        )
+        conn.commit()
+        conn.close()
+        tasks_directory = traj_dir / "traj_0002" / "tasks"
+        tasks_directory.mkdir(parents=True)
+        (tasks_directory / "atom_traj_0002_0001.json").write_text("{}")
+        observer = _observe_registry_transactions(monkeypatch, db_path)
+
+        reset_ids = reset_trajectories(db_path=db_path)
+        reset_trajectories(db_path=db_path)
+
+        assert len(reset_ids) == 2
+        assert observer.statements_in_transaction == 6
+        assert not list(tasks_directory.glob("atom_*.json"))
+        remaining = observer.wrapped.execute(
+            "SELECT atom_id FROM atom_adoption",
+        ).fetchall()
+        assert [row["atom_id"] for row in remaining] == ["atom_traj_9999_0001"]
+        dirty = observer.wrapped.execute(
+            "SELECT filename, deleted, generation, reason"
+            " FROM task_graph_dirty_sources",
+        ).fetchall()
+        assert [tuple(row) for row in dirty] == [
+            ("traj_0001.md", 1, 2, "atom_reset"),
+        ]
+
+    def test_unregister_dir_uses_set_based_statements(
+        self, traj_dir, db_path, monkeypatch,
+    ):
+        wid = register_dir(traj_dir, db_path=db_path)
+        discover_trajectories(wid, traj_dir, db_path=db_path)
+        _seed_source_state(db_path, wid, "traj_0002")
+        conn = get_connection(db_path)
+        conn.execute(
+            "INSERT INTO atom_adoption(atom_id, skill, weightscore, was_new)"
+            " VALUES('atom_traj_0001_0001','s',1,1),('atom_traj_0002_0003','s',1,1),"
+            "('atom_traj_0002x_0001','s',1,1)",
+        )
+        conn.commit()
+        conn.close()
+        observer = _observe_registry_transactions(monkeypatch, db_path)
+
+        assert unregister_dir(traj_dir, db_path=db_path) is True
+
+        assert observer.statements_in_transaction == 3
+        remaining = observer.wrapped.execute(
+            "SELECT atom_id FROM atom_adoption",
+        ).fetchall()
+        assert [row["atom_id"] for row in remaining] == ["atom_traj_0002x_0001"]
+        dirty = observer.wrapped.execute(
+            "SELECT filename, deleted, generation, reason"
+            " FROM task_graph_dirty_sources",
+        ).fetchall()
+        assert [tuple(row) for row in dirty] == [
+            ("traj_0002.md", 1, 1, "watch_dir_removed"),
+        ]

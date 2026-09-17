@@ -1060,6 +1060,54 @@ def test_changed_usage_event_does_not_publish_a_conflicting_generation(tmp_path)
     assert len(list_dirty_sources(db_path=db_path)) == 1
 
 
+def test_projection_serialises_rows_outside_write_transaction(tmp_path, monkeypatch):
+    from xskill.tasks import projection
+
+    db_path = tmp_path / "registry.db"
+    source = _add_source(
+        tmp_path,
+        db_path,
+        source_name="outside-lock",
+        atoms=[{"intent": "锁外序列化", "summary": "只在锁内跑 SQL"}],
+        usage={"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+    )
+    connections = []
+    original_pooled_connection = projection.pooled_connection
+
+    @contextmanager
+    def tracking_pooled_connection(db_path=None):
+        with original_pooled_connection(db_path) as connection:
+            connections.append(connection)
+            yield connection
+
+    in_transaction_calls = []
+    original_json = projection._json
+    original_loads = json.loads
+
+    def json_outside_transaction(value):
+        if any(connection.in_transaction for connection in connections):
+            in_transaction_calls.append(("dumps", value))
+        return original_json(value)
+
+    def loads_outside_transaction(raw, *args, **kwargs):
+        if any(connection.in_transaction for connection in connections):
+            in_transaction_calls.append(("loads", raw))
+        return original_loads(raw, *args, **kwargs)
+
+    monkeypatch.setattr(projection, "pooled_connection", tracking_pooled_connection)
+    monkeypatch.setattr(projection, "_json", json_outside_transaction)
+    monkeypatch.setattr(json, "loads", loads_outside_transaction)
+
+    service = _build(tmp_path, db_path, [source])
+    service.mark_dirty(*source, reason="reproject")
+    result = service.process_dirty()
+
+    assert result["failed_scopes"] == []
+    assert connections
+    assert in_transaction_calls == []
+    assert list_logical_tasks(service.resolver.tenant_id, db_path=db_path)
+
+
 def test_session_append_without_usage_reuses_the_unavailable_fact(tmp_path):
     db_path = tmp_path / "registry.db"
     source = _add_source(

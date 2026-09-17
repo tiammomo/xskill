@@ -581,7 +581,6 @@ def reconcile_native_canary_catalog(
             if path.is_dir() and not path.name.startswith(".")
         ]
     names = {path.name for path in paths}
-    active = 0
     with pooled_connection(Path(db_path)) as conn:
         existing = {
             row["name"]: dict(row)
@@ -594,53 +593,64 @@ def reconcile_native_canary_catalog(
                 (_SOURCE_NATIVE, root),
             ).fetchall()
         }
-        for path in paths:
-            branches = _branch_names(path)
-            state = (
-                "staging" if "staging" in branches
-                else "main" if "main" in branches
-                else "baby" if "baby" in branches
-                else "unknown"
-            )
-            if state == "staging":
-                active += 1
-            if path.name not in existing:
-                row = _read_native_row(path)
-                row["root_key"] = root
-                _upsert_row(conn, row)
-                continue
-            current_main_sha = _ref_sha(path, "main")
-            current_staging_sha = _ref_sha(path, "staging")
-            distributable = int(
-                state in ("main", "staging")
-                and (path / "SKILL.md").is_file()
-            )
-            stored = existing[path.name]
-            if (
-                stored["state"] == state
-                and stored["main_sha"] == current_main_sha
-                and stored["staging_sha"] == current_staging_sha
-                and int(stored["distributable"]) == distributable
-            ):
-                continue
-            conn.execute(
+
+    active = 0
+    new_rows = []
+    ref_updates = []
+    for path in paths:
+        branches = _branch_names(path)
+        state = (
+            "staging" if "staging" in branches
+            else "main" if "main" in branches
+            else "baby" if "baby" in branches
+            else "unknown"
+        )
+        if state == "staging":
+            active += 1
+        if path.name not in existing:
+            row = _read_native_row(path)
+            row["root_key"] = root
+            new_rows.append(row)
+            continue
+        current_main_sha = _ref_sha(path, "main")
+        current_staging_sha = _ref_sha(path, "staging")
+        distributable = int(
+            state in ("main", "staging")
+            and (path / "SKILL.md").is_file()
+        )
+        stored = existing[path.name]
+        if (
+            stored["state"] == state
+            and stored["main_sha"] == current_main_sha
+            and stored["staging_sha"] == current_staging_sha
+            and int(stored["distributable"]) == distributable
+        ):
+            continue
+        ref_updates.append((
+            state,
+            current_main_sha,
+            current_staging_sha,
+            distributable,
+            _native_catalog_key(path.name),
+            _SOURCE_NATIVE,
+            root,
+        ))
+    removed = set(existing) - names
+
+    with pooled_connection(Path(db_path)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for row in new_rows:
+            _upsert_row(conn, row)
+        if ref_updates:
+            conn.executemany(
                 """
                 UPDATE skills_catalog
                 SET state=?, main_sha=?, staging_sha=?, distributable=?,
                     updated_at=datetime('now')
                 WHERE catalog_key=? AND source=? AND root_key=?
                 """,
-                (
-                    state,
-                    current_main_sha,
-                    current_staging_sha,
-                    distributable,
-                    _native_catalog_key(path.name),
-                    _SOURCE_NATIVE,
-                    root,
-                ),
+                ref_updates,
             )
-        removed = set(existing) - names
         if removed:
             conn.executemany(
                 """

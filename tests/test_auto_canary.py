@@ -170,6 +170,31 @@ def test_manifest_pin_side_overrides_auto_canary(tmp_path, monkeypatch):
     _ROUTER.reset()
 
 
+def test_canary_disabled_skips_auto_canary_lookup(tmp_path, monkeypatch):
+    db = tmp_path / "r.db"
+    monkeypatch.setattr("xskill.config.get_registry_db_path", lambda: db)
+    register_dir(tmp_path / "wd", label="t", db_path=db)
+    record_skill_origin(
+        skill_name="s1", user_key="alice", source="import", db_path=db)
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    _make_skill(skills, "s1", with_staging=True)
+
+    def forbidden_lookup(*_args, **_kwargs):
+        raise AssertionError("canary disabled must not query auto-canary users")
+
+    monkeypatch.setattr(
+        "xskill.pipeline.registry.is_auto_canary_user", forbidden_lookup)
+    _ROUTER.reset()
+    resp = build_manifest(
+        client_id="c-alice", skill_dir=skills, probability=1.0,
+        ranked_slots=80, total_slots=100, user_key="alice", db_path=db,
+        canary_enabled=False,
+    )
+    assert resp.slots[0].side == "main"
+    _ROUTER.reset()
+
+
 def test_auto_canary_switches_to_main_when_staging_full(tmp_path, monkeypatch):
     db = tmp_path / "r.db"
     monkeypatch.setattr("xskill.config.get_registry_db_path", lambda: db)
