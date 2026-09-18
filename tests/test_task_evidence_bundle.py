@@ -586,3 +586,51 @@ def test_historical_ranges_still_count_toward_input_bounds():
         build_task_evidence_bundle(
             changed, "task-a", limits=TaskEvidenceLimits(evidence_ranges=2)
         )
+
+
+def test_feed_write_failure_rolls_back_task_projection_and_can_retry(tmp_path):
+    db_path = tmp_path / "registry.db"
+    generation = _generation()
+    project_generation(generation, sources=(), db_path=db_path)
+    first = list_pending_task_evidence(db_path=db_path)
+    assert acknowledge_task_evidence(first, db_path=db_path) == 1
+
+    def snapshot():
+        with get_connection(db_path) as connection:
+            return {
+                table: [
+                    tuple(row) for row in connection.execute(f"SELECT * FROM {table}")
+                ]
+                for table in (
+                    "task_graph_generations",
+                    "logical_tasks",
+                    "task_evidence_feed",
+                )
+            }
+
+    before = snapshot()
+    with get_connection(db_path) as connection:
+        connection.execute(
+            "CREATE TRIGGER reject_feed BEFORE INSERT ON task_evidence_feed "
+            "BEGIN SELECT RAISE(ABORT, 'injected feed write failure'); END"
+        )
+    changed = replace(
+        generation,
+        generation_id="generation-after-failure",
+        tasks=(replace(generation.tasks[0], summary="new evidence"),),
+    )
+    # The exact database error message works with both supported SQLite drivers.
+    with pytest.raises(Exception, match="injected feed write failure"):
+        project_generation(changed, sources=(), db_path=db_path)
+    assert snapshot() == before
+    assert list_pending_task_evidence(db_path=db_path) == []
+
+    with get_connection(db_path) as connection:
+        connection.execute("DROP TRIGGER reject_feed")
+    project_generation(changed, sources=(), db_path=db_path)
+    pending = list_pending_task_evidence(db_path=db_path)
+    assert len(pending) == 1
+    assert pending[0]["generation"] == 2
+    assert pending[0]["task_generation_id"] == changed.generation_id
+    assert acknowledge_task_evidence(first, db_path=db_path) == 0
+    assert acknowledge_task_evidence(pending, db_path=db_path) == 1

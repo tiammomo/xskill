@@ -8,11 +8,7 @@ import time
 
 import pytest
 
-from xskill._sqlite_connect import (
-    _SQLITE_CALL_GATE,
-    _SQLiteCallGate,
-    connect_with_lock,
-)
+from xskill._sqlite_connect import _SQLiteCallGate, connect_with_lock
 
 
 def _run_with_deadline(target, seconds: float) -> bool:
@@ -161,12 +157,13 @@ def test_open_transaction_outruns_a_waiting_finalizer(tmp_path):
 
     finalizer_waiting = threading.Event()
     finalizer_done = threading.Event()
-    _SQLITE_CALL_GATE.enter(exclusive=False)
+    gate = writing_connection._sqlite_gate
+    gate.enter(exclusive=False)
     try:
         def finalize():
             finalizer_waiting.set()
-            _SQLITE_CALL_GATE.enter(exclusive=True)
-            _SQLITE_CALL_GATE.leave(exclusive=True)
+            gate.enter(exclusive=True)
+            gate.leave(exclusive=True)
             finalizer_done.set()
 
         threading.Thread(target=finalize, daemon=True).start()
@@ -180,7 +177,7 @@ def test_open_transaction_outruns_a_waiting_finalizer(tmp_path):
         )
         assert _run_with_deadline(writing_connection.commit, 5)
     finally:
-        _SQLITE_CALL_GATE.leave(exclusive=False)
+        gate.leave(exclusive=False)
     assert finalizer_done.wait(5)
     writing_connection.close()
 
@@ -238,3 +235,7 @@ def test_trajectory_routes_do_not_run_sqlite_on_the_event_loop():
 
     assert not inspect.iscoroutinefunction(api_app.api_list_trajectories)
     assert not inspect.iscoroutinefunction(api_app.api_trajectory_logs)
+    assert not inspect.iscoroutinefunction(api_app.api_trajectory_content)
+    assert not inspect.iscoroutinefunction(api_app.api_list_registry_dirs)
+    assert not inspect.iscoroutinefunction(api_app.api_register_dir)
+    assert not inspect.iscoroutinefunction(api_app.api_unregister_dir)

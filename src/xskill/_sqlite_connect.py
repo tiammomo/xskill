@@ -116,7 +116,6 @@ class _SQLiteCallGate:
                 self._condition.notify_all()
 
 
-_SQLITE_CALL_GATE = _SQLiteCallGate()
 
 
 class _LockedIterator(Iterator[Any]):
@@ -239,6 +238,7 @@ class _LockedConnection(sqlite3.Connection):
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
         self._sqlite_closed = False
+        self._sqlite_gate = _SQLiteCallGate()
 
     def _sqlite_in_transaction(self) -> bool:
         try:
@@ -252,14 +252,14 @@ class _LockedConnection(sqlite3.Connection):
         self, operation: Callable[[], Any], *, exclusive: bool = False,
     ) -> Any:
         """Run one SQLite call under the shared or lifecycle-exclusive gate."""
-        _SQLITE_CALL_GATE.enter(
+        self._sqlite_gate.enter(
             exclusive=exclusive,
             holds_database_lock=not exclusive and self._sqlite_in_transaction(),
         )
         try:
             return operation()
         finally:
-            _SQLITE_CALL_GATE.leave(exclusive=exclusive)
+            self._sqlite_gate.leave(exclusive=exclusive)
 
     def cursor(self, *args: Any, **kwargs: Any) -> _LockedCursor:
         factory = kwargs.pop("factory", _LockedCursor)
@@ -494,6 +494,7 @@ if _pysqlite3 is not None:
         def __init__(self, *args: Any, **kwargs: Any):
             super().__init__(*args, **kwargs)
             self._sqlite_closed = False
+            self._sqlite_gate = _SQLiteCallGate()
 
         def _sqlite_in_transaction(self) -> bool:
             try:
@@ -678,6 +679,7 @@ class _SerializedConnection:
     def __init__(self, connection: Any):
         object.__setattr__(self, "_connection", connection)
         object.__setattr__(self, "_sqlite_closed", False)
+        object.__setattr__(self, "_sqlite_gate", _SQLiteCallGate())
 
     def _sqlite_in_transaction(self) -> bool:
         try:
@@ -688,14 +690,14 @@ class _SerializedConnection:
     def _sqlite_call(
         self, operation: Callable[[], Any], *, exclusive: bool = False,
     ) -> Any:
-        _SQLITE_CALL_GATE.enter(
+        self._sqlite_gate.enter(
             exclusive=exclusive,
             holds_database_lock=not exclusive and self._sqlite_in_transaction(),
         )
         try:
             return operation()
         finally:
-            _SQLITE_CALL_GATE.leave(exclusive=exclusive)
+            self._sqlite_gate.leave(exclusive=exclusive)
 
     def _wrap_cursor(self, cursor: Any) -> Any:
         if cursor is None or isinstance(cursor, _SerializedCursor):
@@ -787,7 +789,7 @@ def connect_with_lock(
     *args: Any,
     **kwargs: Any,
 ) -> _ConnectionT:
-    """Open SQLite using process-wide lifecycle-isolated connection classes."""
+    """Open SQLite using connection classes whose close cannot overlap their own calls."""
     connect_module = str(getattr(connect, "__module__", ""))
     if connect_module.startswith("pysqlite3."):
         selected_factory = _PysqliteLockedConnection
@@ -807,11 +809,7 @@ def connect_with_lock(
         raise ValueError("connect_with_lock requires its guarded connection factory")
     if factory is not None or selected_factory is not None:
         kwargs["factory"] = factory or selected_factory
-    _SQLITE_CALL_GATE.enter(exclusive=False)
-    try:
-        connection = connect(*args, **kwargs)
-    finally:
-        _SQLITE_CALL_GATE.leave(exclusive=False)
+    connection = connect(*args, **kwargs)
     native_types = tuple(allowed_factories)
     if isinstance(connection, native_types + (_SerializedConnection,)):
         return connection

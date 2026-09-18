@@ -291,63 +291,50 @@ def upsert_execution_usage_events(
         events_by_id[event.usage_event_id] = event
     if not events_by_id:
         return 0
+    event_ids = sorted(events_by_id)
     with pooled_connection(db_path) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        existing_by_id: dict[str, dict] = {}
-        event_ids = sorted(events_by_id)
-        for offset in range(0, len(event_ids), 500):
-            chunk = event_ids[offset:offset + 500]
-            placeholders = ",".join("?" for _ in chunk)
-            for row in connection.execute(
-                "SELECT * FROM execution_usage_events"
-                f" WHERE usage_event_id IN ({placeholders})",
-                chunk,
-            ).fetchall():
-                existing_by_id[row["usage_event_id"]] = dict(row)
-        inserted = 0
-        rows = []
-        for event_id, event in events_by_id.items():
-            existing = existing_by_id.get(event_id)
-            if existing is not None:
-                expected = event.to_record()
-                actual = {
-                    "usage_event_id": existing["usage_event_id"],
-                    "usage_plane": existing["usage_plane"],
-                    "source_event_id": existing["source_event_id"],
-                    "tenant_id": existing["tenant_id"],
-                    "task_scope_id": existing["task_scope_id"],
-                    "source_scope_id": existing["source_scope_id"],
-                    "traj_id": existing["traj_id"],
-                    "model": json.loads(existing["model_json"]),
-                    "harness": json.loads(existing["harness_json"]),
-                    "prompt_tokens": existing["prompt_tokens"],
-                    "completion_tokens": existing["completion_tokens"],
-                    "total_tokens": existing["total_tokens"],
-                    "cache_read_tokens": existing["cache_read_tokens"],
-                    "cost_usd": existing["cost_usd"],
-                    "measurement_quality": existing["measurement_quality"],
-                    "estimation_method": existing["estimation_method"],
-                    "unavailable_reason": existing["unavailable_reason"],
-                }
-                expected.pop("observed_at", None)
-                if actual != expected:
-                    connection.rollback()
-                    raise RuntimeError(
-                        f"immutable execution usage event changed: {event_id}"
-                    )
-                continue
-            rows.append(event)
-            inserted += 1
-        connection.executemany(
-            "INSERT INTO execution_usage_events("
-            "usage_event_id,usage_plane,source_event_id,tenant_id,task_scope_id,"
-            "source_scope_id,traj_id,model_json,harness_json,prompt_tokens,"
-            "completion_tokens,total_tokens,cache_read_tokens,cost_usd,"
-            "measurement_quality,estimation_method,unavailable_reason,observed_at)"
-            " VALUES(?,'execution',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-            " ON CONFLICT(usage_event_id) DO NOTHING",
-            [
-                (
+        while True:
+            existing_by_id: dict[str, dict] = {}
+            for offset in range(0, len(event_ids), 500):
+                chunk = event_ids[offset:offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                for row in connection.execute(
+                    "SELECT * FROM execution_usage_events"
+                    f" WHERE usage_event_id IN ({placeholders})",
+                    chunk,
+                ).fetchall():
+                    existing_by_id[row["usage_event_id"]] = dict(row)
+            pending_rows = []
+            for event_id, event in events_by_id.items():
+                existing = existing_by_id.get(event_id)
+                if existing is not None:
+                    expected = event.to_record()
+                    actual = {
+                        "usage_event_id": existing["usage_event_id"],
+                        "usage_plane": existing["usage_plane"],
+                        "source_event_id": existing["source_event_id"],
+                        "tenant_id": existing["tenant_id"],
+                        "task_scope_id": existing["task_scope_id"],
+                        "source_scope_id": existing["source_scope_id"],
+                        "traj_id": existing["traj_id"],
+                        "model": json.loads(existing["model_json"]),
+                        "harness": json.loads(existing["harness_json"]),
+                        "prompt_tokens": existing["prompt_tokens"],
+                        "completion_tokens": existing["completion_tokens"],
+                        "total_tokens": existing["total_tokens"],
+                        "cache_read_tokens": existing["cache_read_tokens"],
+                        "cost_usd": existing["cost_usd"],
+                        "measurement_quality": existing["measurement_quality"],
+                        "estimation_method": existing["estimation_method"],
+                        "unavailable_reason": existing["unavailable_reason"],
+                    }
+                    expected.pop("observed_at", None)
+                    if actual != expected:
+                        raise RuntimeError(
+                            f"immutable execution usage event changed: {event_id}"
+                        )
+                    continue
+                pending_rows.append((
                     event.usage_event_id, event.source_event_id,
                     event.session_ref.tenant_id, event.session_ref.task_scope_id,
                     event.session_ref.source_scope_id, event.session_ref.traj_id,
@@ -357,12 +344,25 @@ def upsert_execution_usage_events(
                     event.measurement_quality, event.estimation_method,
                     event.unavailable_reason,
                     event.observed_at,
-                )
-                for event in rows
-            ],
-        )
-        connection.commit()
-        return inserted
+                ))
+            if not pending_rows:
+                return 0
+            connection.execute("BEGIN IMMEDIATE")
+            inserted = connection.executemany(
+                "INSERT INTO execution_usage_events("
+                "usage_event_id,usage_plane,source_event_id,tenant_id,task_scope_id,"
+                "source_scope_id,traj_id,model_json,harness_json,prompt_tokens,"
+                "completion_tokens,total_tokens,cache_read_tokens,cost_usd,"
+                "measurement_quality,estimation_method,unavailable_reason,observed_at)"
+                " VALUES(?,'execution',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(usage_event_id) DO NOTHING",
+                pending_rows,
+            ).rowcount
+            if inserted == len(pending_rows):
+                connection.commit()
+                return inserted
+            # Short rowcount: another writer landed some ids since the read pass; redo the check.
+            connection.rollback()
 
 
 _PROJECTED_TABLES = (
@@ -457,8 +457,117 @@ def project_generation(
 
     tenant_id = generation.tenant_id
     task_scope_id = generation.task_scope_id
-    source_list = tuple(sources)
     evidence_feed_rows = _task_evidence_feed_rows(generation)
+    generation_row = (
+        tenant_id, task_scope_id, generation.generation_id,
+        generation.source_revision,
+        _generator_json(generation.generator),
+        generation.base_override_seq,
+        generation.created_at, generation.metrics.get("task_count", 0),
+        generation.metrics.get("atom_count", 0),
+        generation.metrics.get("candidate_count", 0),
+        generation.metrics.get("model_judgement_count", 0),
+    )
+    logical_task_rows = [
+        (
+            tenant_id, task_scope_id, task.task_id,
+            generation.generation_id, task.title, task.summary,
+            task.lifecycle, task.outcome, task.verification,
+            task.user_disposition, task.created_at, int(task.tombstoned),
+            _json(list(task.aliases)),
+            _json([item.to_dict() for item in task.decisions]),
+            task_primary_counts.get(task.task_id, 0),
+            task_attempt_counts.get(task.task_id, 0),
+            task_tokens.get(task.task_id) if task.task_id in task_has_tokens else None,
+            task_costs.get(task.task_id) if task.task_id in task_has_cost else None,
+        )
+        for task in generation.tasks
+    ]
+    membership_rows = [
+        (
+            tenant_id, task_scope_id, item.membership_id,
+            generation.generation_id, item.task_id,
+            item.atom_ref.source_scope_id, item.atom_ref.traj_id,
+            item.atom_ref.atom_id, item.role, item.decision,
+            item.confidence, item.decided_by, item.algorithm_version,
+            _json(list(item.evidence_refs)), item.observed_at,
+            int(item.stale),
+        )
+        for item in generation.memberships
+    ]
+    relation_rows = [
+        (
+            tenant_id, task_scope_id, item.relation_id,
+            generation.generation_id, item.from_task_id,
+            item.to_task_id, item.relation_type, item.decision,
+            item.confidence, item.decided_by, item.algorithm_version,
+            _json(list(item.evidence_refs)), item.observed_at,
+            int(item.stale),
+        )
+        for item in generation.relations
+    ]
+    attempt_rows = [
+        (
+            tenant_id, task_scope_id, item.attempt_id,
+            generation.generation_id, item.task_id, item.started_at,
+            item.ended_at, item.lifecycle, item.outcome,
+            item.verification, item.user_disposition,
+            _json([decision.to_dict() for decision in item.decisions]),
+            _json(item.execution_identity), len(item.evidence_ranges),
+            attempt_tokens.get(item.attempt_id)
+            if item.attempt_id in attempt_has_tokens else None,
+            attempt_costs.get(item.attempt_id)
+            if item.attempt_id in attempt_has_cost else None,
+        )
+        for item in generation.attempts
+    ]
+    evidence_rows = []
+    for attempt in generation.attempts:
+        for evidence in attempt.evidence_ranges:
+            evidence_rows.append((
+                tenant_id, task_scope_id, evidence.evidence_id,
+                generation.generation_id, attempt.attempt_id,
+                evidence.session_ref.source_scope_id,
+                evidence.session_ref.traj_id,
+                evidence.atom_ref.atom_id if evidence.atom_ref else None,
+                evidence.locator_kind, str(evidence.start), str(evidence.end),
+                evidence.content_hash, evidence.atom_hash,
+                int(evidence.stale),
+                _json(evidence.model), _json(evidence.harness),
+                _json(list(evidence.skills)),
+            ))
+    attempt_relation_rows = [
+        (
+            tenant_id, task_scope_id, item.relation_id,
+            generation.generation_id, item.from_attempt_id,
+            item.to_attempt_id, item.relation_type, item.decision,
+            item.confidence, item.decided_by, item.algorithm_version,
+            _json(list(item.evidence_refs)), item.observed_at,
+        )
+        for item in generation.attempt_relations
+    ]
+    allocation_rows = [
+        (
+            tenant_id, task_scope_id, item.allocation_id,
+            generation.generation_id, item.usage_event_id,
+            item.usage_plane, item.allocation_mode, item.fraction,
+            item.task_id, item.attempt_id, item.processing_step,
+            item.prompt_tokens, item.completion_tokens,
+            item.total_tokens, item.cache_read_tokens,
+            item.cost_usd, item.method,
+            item.method_version,
+        )
+        for item in generation.usage_allocations
+    ]
+    source_state_rows = [
+        (
+            tenant_id, task_scope_id, source.session_ref.source_scope_id,
+            source.watch_dir_id, source.session_ref.traj_id,
+            source.source_revision, generation.generation_id,
+        )
+        for source in sources
+    ]
+
     with pooled_connection(db_path) as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
@@ -480,16 +589,7 @@ def project_generation(
                 " created_at=excluded.created_at,task_count=excluded.task_count,"
                 " atom_count=excluded.atom_count,candidate_count=excluded.candidate_count,"
                 " model_judgement_count=excluded.model_judgement_count",
-                (
-                    tenant_id, task_scope_id, generation.generation_id,
-                    generation.source_revision,
-                    _generator_json(generation.generator),
-                    generation.base_override_seq,
-                    generation.created_at, generation.metrics.get("task_count", 0),
-                    generation.metrics.get("atom_count", 0),
-                    generation.metrics.get("candidate_count", 0),
-                    generation.metrics.get("model_judgement_count", 0),
-                ),
+                generation_row,
             )
             connection.executemany(
                 "INSERT INTO logical_tasks("
@@ -498,21 +598,7 @@ def project_generation(
                 "tombstoned,aliases_json,decisions_json,primary_atom_count,"
                 "attempt_count,execution_tokens,execution_cost_usd)"
                 " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                [
-                    (
-                        tenant_id, task_scope_id, task.task_id,
-                        generation.generation_id, task.title, task.summary,
-                        task.lifecycle, task.outcome, task.verification,
-                        task.user_disposition, task.created_at, int(task.tombstoned),
-                        _json(list(task.aliases)),
-                        _json([item.to_dict() for item in task.decisions]),
-                        task_primary_counts.get(task.task_id, 0),
-                        task_attempt_counts.get(task.task_id, 0),
-                        task_tokens.get(task.task_id) if task.task_id in task_has_tokens else None,
-                        task_costs.get(task.task_id) if task.task_id in task_has_cost else None,
-                    )
-                    for task in generation.tasks
-                ],
+                logical_task_rows,
             )
             connection.executemany(
                 "INSERT INTO task_atom_memberships("
@@ -520,18 +606,7 @@ def project_generation(
                 "source_scope_id,traj_id,atom_id,role,decision,confidence,"
                 "decided_by,algorithm_version,evidence_refs_json,observed_at,stale)"
                 " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                [
-                    (
-                        tenant_id, task_scope_id, item.membership_id,
-                        generation.generation_id, item.task_id,
-                        item.atom_ref.source_scope_id, item.atom_ref.traj_id,
-                        item.atom_ref.atom_id, item.role, item.decision,
-                        item.confidence, item.decided_by, item.algorithm_version,
-                        _json(list(item.evidence_refs)), item.observed_at,
-                        int(item.stale),
-                    )
-                    for item in generation.memberships
-                ],
+                membership_rows,
             )
             connection.executemany(
                 "INSERT INTO task_relations("
@@ -539,17 +614,7 @@ def project_generation(
                 "to_task_id,relation_type,decision,confidence,decided_by,"
                 "algorithm_version,evidence_refs_json,observed_at,stale)"
                 " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                [
-                    (
-                        tenant_id, task_scope_id, item.relation_id,
-                        generation.generation_id, item.from_task_id,
-                        item.to_task_id, item.relation_type, item.decision,
-                        item.confidence, item.decided_by, item.algorithm_version,
-                        _json(list(item.evidence_refs)), item.observed_at,
-                        int(item.stale),
-                    )
-                    for item in generation.relations
-                ],
+                relation_rows,
             )
             connection.executemany(
                 "INSERT INTO task_attempts("
@@ -558,37 +623,8 @@ def project_generation(
                 "user_disposition,decisions_json,execution_identity_json,"
                 "evidence_count,execution_tokens,execution_cost_usd)"
                 " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                [
-                    (
-                        tenant_id, task_scope_id, item.attempt_id,
-                        generation.generation_id, item.task_id, item.started_at,
-                        item.ended_at, item.lifecycle, item.outcome,
-                        item.verification, item.user_disposition,
-                        _json([decision.to_dict() for decision in item.decisions]),
-                        _json(item.execution_identity), len(item.evidence_ranges),
-                        attempt_tokens.get(item.attempt_id)
-                        if item.attempt_id in attempt_has_tokens else None,
-                        attempt_costs.get(item.attempt_id)
-                        if item.attempt_id in attempt_has_cost else None,
-                    )
-                    for item in generation.attempts
-                ],
+                attempt_rows,
             )
-            evidence_rows = []
-            for attempt in generation.attempts:
-                for evidence in attempt.evidence_ranges:
-                    evidence_rows.append((
-                        tenant_id, task_scope_id, evidence.evidence_id,
-                        generation.generation_id, attempt.attempt_id,
-                        evidence.session_ref.source_scope_id,
-                        evidence.session_ref.traj_id,
-                        evidence.atom_ref.atom_id if evidence.atom_ref else None,
-                        evidence.locator_kind, str(evidence.start), str(evidence.end),
-                        evidence.content_hash, evidence.atom_hash,
-                        int(evidence.stale),
-                        _json(evidence.model), _json(evidence.harness),
-                        _json(list(evidence.skills)),
-                    ))
             connection.executemany(
                 "INSERT INTO task_evidence_ranges("
                 "tenant_id,task_scope_id,evidence_id,generation_id,attempt_id,"
@@ -603,16 +639,7 @@ def project_generation(
                 "to_attempt_id,relation_type,decision,confidence,decided_by,"
                 "algorithm_version,evidence_refs_json,observed_at)"
                 " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                [
-                    (
-                        tenant_id, task_scope_id, item.relation_id,
-                        generation.generation_id, item.from_attempt_id,
-                        item.to_attempt_id, item.relation_type, item.decision,
-                        item.confidence, item.decided_by, item.algorithm_version,
-                        _json(list(item.evidence_refs)), item.observed_at,
-                    )
-                    for item in generation.attempt_relations
-                ],
+                attempt_relation_rows,
             )
             connection.executemany(
                 "INSERT INTO task_usage_allocations("
@@ -621,19 +648,7 @@ def project_generation(
                 "processing_step,prompt_tokens,completion_tokens,total_tokens,"
                 "cache_read_tokens,cost_usd,method,method_version)"
                 " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                [
-                    (
-                        tenant_id, task_scope_id, item.allocation_id,
-                        generation.generation_id, item.usage_event_id,
-                        item.usage_plane, item.allocation_mode, item.fraction,
-                        item.task_id, item.attempt_id, item.processing_step,
-                        item.prompt_tokens, item.completion_tokens,
-                        item.total_tokens, item.cache_read_tokens,
-                        item.cost_usd, item.method,
-                        item.method_version,
-                    )
-                    for item in generation.usage_allocations
-                ],
+                allocation_rows,
             )
             connection.execute(
                 "DELETE FROM task_graph_source_state"
@@ -652,14 +667,7 @@ def project_generation(
                 " source_revision=excluded.source_revision,"
                 " generation_id=excluded.generation_id,"
                 " updated_at=datetime('now')",
-                [
-                    (
-                        tenant_id, task_scope_id, source.session_ref.source_scope_id,
-                        source.watch_dir_id, source.session_ref.traj_id,
-                        source.source_revision, generation.generation_id,
-                    )
-                    for source in source_list
-                ],
+                source_state_rows,
             )
             connection.executemany(
                 "INSERT INTO task_evidence_feed("

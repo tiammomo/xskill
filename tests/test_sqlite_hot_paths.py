@@ -149,7 +149,35 @@ class _FakeConnectionOperation:
 
 
 def test_close_cannot_overlap_an_active_call():
-    """Connection close is isolated from any other SQLite call."""
+    """A connection's close waits for that connection's in-flight call."""
+    from xskill._sqlite_connect import connect_with_lock
+
+    probe = _ConcurrencyProbe()
+    barrier = threading.Barrier(2)
+    raw = _FakeConnectionOperation(probe)
+    conn = connect_with_lock(lambda **_kwargs: raw)
+    cursor = conn.execute("SELECT 1")
+
+    def fetch_during_close():
+        barrier.wait(timeout=10)
+        return cursor.fetchone()
+
+    def close_during_fetch():
+        barrier.wait(timeout=10)
+        return conn.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        fetch_future = executor.submit(fetch_during_close)
+        close_future = executor.submit(close_during_fetch)
+        assert fetch_future.result(timeout=10) == (1,)
+        close_future.result(timeout=10)
+
+    assert raw.closed.is_set()
+    assert probe.max_active == 1
+
+
+def test_close_of_one_connection_overlaps_another_connections_call():
+    """Closing connection A never waits for work on connection B."""
     from xskill._sqlite_connect import connect_with_lock
 
     probe = _ConcurrencyProbe()
@@ -175,8 +203,7 @@ def test_close_cannot_overlap_an_active_call():
         close_future.result(timeout=10)
 
     assert close_raw.closed.is_set()
-    assert probe.max_active == 1
-    # Do not leave proxy finalizers to affect a later concurrency assertion.
+    assert probe.max_active == 2
     cursor.close()
     fetch_conn.close()
 
@@ -220,8 +247,8 @@ def test_fetch_and_connect_overlap_while_no_close_waits():
     connected.close()
 
 
-def test_connection_proxy_gc_closes_under_the_operation_lock():
-    """Fallback proxy finalization cannot overlap another SQLite C call."""
+def test_connection_proxy_gc_close_does_not_wait_for_other_connections():
+    """Fallback proxy finalization closes its own raw connection promptly."""
     from xskill._sqlite_connect import connect_with_lock
 
     probe = _ConcurrencyProbe()
@@ -242,15 +269,14 @@ def test_connection_proxy_gc_closes_under_the_operation_lock():
         assert started.wait(timeout=10)
         holder.pop()
         gc.collect()
+        return raw.closed.is_set()
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         connect_future = executor.submit(connect_with_lock, slow_connect)
         gc_future = executor.submit(release_last_reference)
         connected = connect_future.result(timeout=10)
-        gc_future.result(timeout=10)
+        assert gc_future.result(timeout=10)
 
-    assert raw.closed.wait(timeout=10)
-    assert probe.max_active == 1
     connected.close()
 
 
