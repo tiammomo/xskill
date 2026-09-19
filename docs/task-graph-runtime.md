@@ -139,3 +139,23 @@ worker 启动时会比较已投影 generation 与当前 linker 版本及有界�
 关闭开关只停止新增 Task Graph 处理，已投影来源的变化仍以轻量脏记录保留供后续重新启用时追平，从未投影的来源由首次启用回填扫描发现，同时不会删除 Session、Atom、usage ledger、generation、override 或 SQLite 投影。
 
 `xskill rebuild --force` 会清理可重建 Task 投影和 generation source state，但保留已经发生且付费的原始 usage ledger。
+
+### Candidate evidence freshness
+
+Task candidates use schema version 2 and persist `task_evidence_fingerprint`,
+which has the same meaning as the learning queue's evidence version. It is not
+interchangeable with the Task-only fingerprint or the generation-dependent
+bundle fingerprint. Schema-1 records remain readable, but their missing evidence
+version is left unknown; an old Task candidate needs fresh evidence processing,
+not a fingerprint copied onto its old conclusion.
+
+`ready_for_promotion_v2(..., db_path=registry_path)` checks Task support against
+the current tenant/scope/task record before applying the score threshold. Missing,
+changed, rejected or ineligible evidence contributes no score. Without an explicit
+registry, Task support is held; Atom-only selection keeps its existing behavior
+and does not open a registry. Reads use bounded batches in one database snapshot.
+
+This is an early selection check, not permission to commit a Skill. The Task
+consumer still needs to use the same selection in ordinary, baby and jam paths,
+recheck evidence at commit, and acknowledge only the processed candidate/queue
+version. Current production consumers have not completed that integration.

@@ -35,7 +35,7 @@ from xskill.tasks.models import (
     AtomRef,
 )
 
-CANDIDATE_SCHEMA_VERSION = 1
+CANDIDATE_SCHEMA_VERSION = 2
 EVIDENCE_UNITS = frozenset(("logical_task", "atom_fallback"))
 FALLBACK_REASONS = frozenset(
     (
@@ -81,6 +81,7 @@ class TaskSkillCandidate:
     learning_eligibility: str
     eligibility_reasons: tuple[str, ...]
     fallback_reason: str | None
+    task_evidence_fingerprint: str | None = None
     schema_version: int = CANDIDATE_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -172,6 +173,7 @@ class TaskSkillCandidate:
 
     @property
     def contributes_to_promotion(self) -> bool:
+        """Recorded eligibility only; promotion also requires current evidence."""
         if self.evidence_unit == "logical_task":
             return self.learning_eligibility == "eligible"
         return self.fallback_reason in PROMOTION_ELIGIBLE_FALLBACK_REASONS
@@ -179,6 +181,7 @@ class TaskSkillCandidate:
     def _validate_evidence_shape(self) -> None:
         fingerprint_fields = (
             (self.task_fingerprint, "task_fingerprint"),
+            (self.task_evidence_fingerprint, "task_evidence_fingerprint"),
             (self.generation_fingerprint, "generation_fingerprint"),
             (self.bundle_fingerprint, "bundle_fingerprint"),
             (self.generator_fingerprint, "generator_fingerprint"),
@@ -266,6 +269,10 @@ class TaskSkillCandidate:
             all(value is None for value in task_fields),
             "atom_fallback cannot claim Task provenance",
         )
+        _ensure(
+            self.task_evidence_fingerprint is None,
+            "atom_fallback cannot claim Task evidence fingerprint",
+        )
         _ensure(not self.attempt_refs, "atom_fallback cannot claim Attempts")
         _ensure(len(self.atom_refs) == 1, "atom_fallback requires exactly one Atom")
         _ensure(
@@ -311,6 +318,7 @@ class TaskSkillCandidate:
             "task_scope_id": self.task_scope_id,
             "task_id": self.task_id,
             "task_fingerprint": self.task_fingerprint,
+            "task_evidence_fingerprint": self.task_evidence_fingerprint,
             "generation_id": self.generation_id,
             "generation_fingerprint": self.generation_fingerprint,
             "bundle_fingerprint": self.bundle_fingerprint,
@@ -329,7 +337,19 @@ class TaskSkillCandidate:
     @classmethod
     def from_dict(cls, value: Any) -> TaskSkillCandidate:
         expected = set(cls.__dataclass_fields__)
+        legacy = (
+            isinstance(value, dict)
+            and type(value.get("schema_version")) is int
+            and value["schema_version"] == 1
+        )
+        if legacy:
+            expected.remove("task_evidence_fingerprint")
         data = dict(_strict_object(value, expected, "TaskSkillCandidate"))
+        if legacy:
+            # Old records do not contain the semantic evidence version. Never
+            # infer it from Task-only or generation-dependent fingerprints.
+            data["schema_version"] = CANDIDATE_SCHEMA_VERSION
+            data["task_evidence_fingerprint"] = None
         atom_refs = data["atom_refs"]
         attempt_refs = data["attempt_refs"]
         eligibility_reasons = data["eligibility_reasons"]
@@ -401,6 +421,7 @@ class TaskSkillCandidate:
             task_scope_id=bundle.task_scope_id,
             task_id=bundle.task.task_id,
             task_fingerprint=_fingerprint(bundle.task.to_dict()),
+            task_evidence_fingerprint=bundle.task_evidence_fingerprint,
             generation_id=bundle.generation_id,
             generation_fingerprint=generation_fingerprint,
             bundle_fingerprint=bundle.bundle_fingerprint,

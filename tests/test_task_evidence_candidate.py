@@ -101,7 +101,7 @@ def test_task_candidate_is_versioned_bounded_private_and_round_trips():
 
     payload = candidate.to_dict()
     serialized = json.dumps(payload, ensure_ascii=False)
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["evidence_unit"] == "logical_task"
     assert [item["atom_id"] for item in payload["atom_refs"]] == [
         "atom-a",
@@ -171,7 +171,8 @@ def test_ineligible_task_never_promotes_and_revokes_prior_support():
     data = {"candidates": []}
 
     assert upsert_evidence_candidates(data, (eligible,)) == ([True], 10)
-    assert ready_for_promotion_v2(data, threshold=10)
+    # Stored eligibility alone is insufficient without current registry proof.
+    assert ready_for_promotion_v2(data, threshold=10) == []
     assert upsert_evidence_candidates(data, (needs_review,)) == ([False], 0)
     assert ready_for_promotion_v2(data, threshold=10) == []
 
@@ -272,3 +273,154 @@ def test_candidate_atom_references_have_a_hard_bound():
                 for index in range(MAX_CANDIDATE_ATOM_REFS + 1)
             ),
         )
+
+
+def test_promotion_checks_current_evidence_and_preserves_atom_compatibility(tmp_path):
+    from tests.test_task_evidence_bundle import _generation
+    from xskill.tasks.projection import project_generation
+
+    db = tmp_path / "registry.db"
+    generation = _generation()
+    bundle = build_task_evidence_bundle(generation, "task-a")
+    candidate = TaskSkillCandidate.from_task_bundle(
+        bundle,
+        skill_name="safe-skill",
+        weightscore=10,
+    )
+    legacy_atom = {"atom_id": "legacy-atom", "weightscore": 10}
+    data = {"candidates": [candidate.to_dict(), legacy_atom]}
+    project_generation(generation, sources=(), db_path=db)
+    assert ready_for_promotion_v2(data, threshold=20, db_path=db) == data["candidates"]
+    assert ready_for_promotion_v2(data, threshold=20) == []
+    assert ready_for_promotion_v2(data) == [legacy_atom]
+
+    metadata = replace(generation, generation_id="rebuilt")
+    project_generation(metadata, sources=(), db_path=db)
+    assert ready_for_promotion_v2(data, threshold=20, db_path=db)
+    from xskill.tasks.projection import (
+        acknowledge_task_evidence,
+        list_pending_task_evidence,
+    )
+
+    assert (
+        acknowledge_task_evidence(list_pending_task_evidence(db_path=db), db_path=db)
+        == 1
+    )
+    assert ready_for_promotion_v2(data, threshold=20, db_path=db)
+    attempt = generation.attempts[0]
+    changed_attempt = replace(
+        attempt,
+        evidence_ranges=(replace(attempt.evidence_ranges[0], content_hash="changed"),),
+    )
+    changed = replace(
+        generation,
+        generation_id="new-evidence",
+        attempts=(changed_attempt, *generation.attempts[1:]),
+    )
+    changed_bundle = build_task_evidence_bundle(changed, "task-a")
+    refreshed = TaskSkillCandidate.from_task_bundle(
+        changed_bundle,
+        skill_name="safe-skill",
+        weightscore=10,
+    )
+    assert refreshed.task_fingerprint == candidate.task_fingerprint
+    assert refreshed.task_evidence_fingerprint != candidate.task_evidence_fingerprint
+    project_generation(changed, sources=(), db_path=db)
+    assert ready_for_promotion_v2(data, threshold=20, db_path=db) == []
+    assert ready_for_promotion_v2(data, db_path=db) == [legacy_atom]
+    assert data["candidates"][0] == candidate.to_dict()
+    upsert_evidence_candidates(data, (refreshed,))
+    assert ready_for_promotion_v2(data, threshold=20, db_path=db)
+
+
+@pytest.mark.parametrize(
+    "change", ["deleted", "tenant", "scope", "ineligible", "rejected"]
+)
+def test_promotion_requires_exact_current_scope_and_eligibility(tmp_path, change):
+    from tests.test_task_evidence_bundle import _generation
+    from xskill.pipeline.registry import get_connection
+    from xskill.tasks.projection import project_generation
+
+    db = tmp_path / "registry.db"
+    generation = _generation()
+    candidate = TaskSkillCandidate.from_task_bundle(
+        build_task_evidence_bundle(generation, "task-a"),
+        skill_name="safe-skill",
+        weightscore=10,
+    )
+    project_generation(generation, sources=(), db_path=db)
+    statements = {
+        "deleted": "DELETE FROM task_evidence_feed",
+        "tenant": "UPDATE task_evidence_feed SET tenant_id='other'",
+        "scope": "UPDATE task_evidence_feed SET task_scope_id='other'",
+        "ineligible": "UPDATE task_evidence_feed SET learning_eligibility='ineligible'",
+        "rejected": "UPDATE task_evidence_feed SET status='rejected'",
+    }
+    with get_connection(db) as connection:
+        connection.execute(statements[change])
+    assert (
+        ready_for_promotion_v2({"candidates": [candidate.to_dict()]}, db_path=db) == []
+    )
+
+
+def test_old_task_candidate_has_no_invented_evidence_version(tmp_path):
+    from tests.test_task_evidence_bundle import _generation
+    from xskill.tasks.projection import project_generation
+
+    db = tmp_path / "registry.db"
+    generation = _generation()
+    candidate = TaskSkillCandidate.from_task_bundle(
+        build_task_evidence_bundle(generation, "task-a"),
+        skill_name="safe-skill",
+        weightscore=10,
+    )
+    old = candidate.to_dict()
+    old["schema_version"] = 1
+    old.pop("task_evidence_fingerprint")
+    restored = TaskSkillCandidate.from_dict(old)
+    assert restored.task_evidence_fingerprint is None
+    assert restored.to_dict()["schema_version"] == 2
+    assert old["schema_version"] == 1
+    project_generation(generation, sources=(), db_path=db)
+    assert ready_for_promotion_v2({"candidates": [old]}, db_path=db) == []
+
+
+def test_version_lookup_handles_more_than_sqlite_legacy_parameter_limit(tmp_path):
+    from xskill.pipeline.registry import get_connection
+    from xskill.tasks.projection import current_task_evidence_versions
+
+    db = tmp_path / "registry.db"
+    keys = [("tenant", "scope", f"task-{i}") for i in range(400)]
+    with get_connection(db) as connection:
+        connection.executemany(
+            "INSERT INTO task_evidence_feed(tenant_id,task_scope_id,task_id,"
+            "task_generation_id,task_evidence_fingerprint,learning_eligibility,"
+            "eligibility_reasons_json,status) VALUES(?,?,?,'gen','hash','eligible','[]','pending')",
+            keys,
+        )
+    versions = current_task_evidence_versions(keys, db_path=db)
+    assert set(versions) == set(keys)
+    assert set(versions.values()) == {("hash", "eligible", "pending")}
+
+
+def test_schema_one_atom_fallback_stays_compatible():
+    candidate = TaskSkillCandidate.from_atom_fallback(
+        atom_id="old-atom",
+        skill_name="safe-skill",
+        weightscore=10,
+        fallback_reason="legacy_atom_candidate",
+    ).to_dict()
+    candidate["schema_version"] = 1
+    candidate.pop("task_evidence_fingerprint")
+    assert ready_for_promotion_v2({"candidates": [candidate]}) == [candidate]
+
+
+def test_boolean_schema_version_is_not_accepted_as_legacy():
+    candidate = TaskSkillCandidate.from_task_bundle(
+        _bundle(),
+        skill_name="safe-skill",
+        weightscore=10,
+    ).to_dict()
+    candidate["schema_version"] = True
+    with pytest.raises(EvidenceCandidateError):
+        TaskSkillCandidate.from_dict(candidate)

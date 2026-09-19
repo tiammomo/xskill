@@ -362,27 +362,49 @@ def add_evidence_candidates(
 
 def ready_for_promotion_v2(
     data: dict, threshold: int = ATOM_PROMOTION_THRESHOLD,
+    *, db_path: Path | None = None,
 ) -> list[dict]:
-    """v2.1 简化：candidates 全是 pending（无 promoted 字段），sum 所有
-    ``weightscore`` ≥ threshold 即 ready。
+    """Select support against current Task evidence before applying threshold.
 
-    返回 buffer 中所有 candidates iff 总分 ≥ threshold；否则空列表。
+    Task support requires an explicit registry and a matching semantic evidence
+    version. Legacy Task records without that version are held for reprocessing.
+    Atom-only callers keep their previous behavior without opening a registry.
+    This snapshot does not replace the consumer's final pre-commit check.
     """
     from xskill.skill.evidence_candidates import TaskSkillCandidate
 
-    cands = data.get("candidates", []) or []
-    promotable = []
-    total = 0
-    for candidate in cands:
+    selected = []
+    tasks = {}
+    for candidate in data.get("candidates", []) or []:
         if "schema_version" in candidate or "candidate_id" in candidate:
             parsed = TaskSkillCandidate.from_dict(candidate)
             if not parsed.contributes_to_promotion:
                 continue
+            if parsed.evidence_unit == "logical_task":
+                if db_path is None or parsed.task_evidence_fingerprint is None:
+                    continue
+                identity = (parsed.tenant_id, parsed.task_scope_id, parsed.task_id)
+                tasks[len(selected)] = (identity, parsed.task_evidence_fingerprint)
+        selected.append(candidate)
+    versions = {}
+    if tasks:
+        from xskill.tasks.projection import current_task_evidence_versions
+
+        versions = current_task_evidence_versions(
+            (identity for identity, _ in tasks.values()), db_path=db_path,
+        )
+    promotable = []
+    for index, candidate in enumerate(selected):
+        if index in tasks:
+            identity, fingerprint = tasks[index]
+            current = versions.get(identity)
+            if current is None or current[0] != fingerprint:
+                continue
+            if current[1] != "eligible" or current[2] not in {"pending", "processed"}:
+                continue
         promotable.append(candidate)
-        total += int(candidate.get("weightscore", 0))
-    if total >= threshold:
-        return promotable
-    return []
+    total = sum(int(candidate.get("weightscore", 0)) for candidate in promotable)
+    return promotable if total >= threshold else []
 
 
 def clear_candidates(skill_dir: Path) -> None:

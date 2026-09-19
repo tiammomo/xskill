@@ -726,6 +726,43 @@ def list_pending_task_evidence(
     ]
 
 
+def current_task_evidence_versions(
+    identities: Iterable[tuple[str, str, str]], *, db_path: Path,
+) -> dict[tuple[str, str, str], tuple[str, str, str]]:
+    """Read exact tenant/scope/task versions in one bounded-query snapshot.
+
+    This is selection evidence, not a lease: consumers must check again at
+    commit time. A missing Task has no entry and must not remain promotable.
+    """
+    keys = sorted(set(identities))
+    if not keys:
+        return {}
+    result = {}
+    with pooled_connection(db_path) as connection:
+        connection.execute("BEGIN")
+        try:
+            for offset in range(0, len(keys), 250):
+                chunk = keys[offset:offset + 250]
+                placeholders = ",".join("(?,?,?)" for _ in chunk)
+                rows = connection.execute(
+                    "SELECT tenant_id,task_scope_id,task_id,"
+                    "task_evidence_fingerprint,learning_eligibility,status"
+                    " FROM task_evidence_feed"
+                    " WHERE (tenant_id,task_scope_id,task_id) IN (VALUES "
+                    + placeholders + ")",
+                    [part for key in chunk for part in key],
+                ).fetchall()
+                for row in rows:
+                    result[(row["tenant_id"], row["task_scope_id"], row["task_id"])] = (
+                        row["task_evidence_fingerprint"],
+                        row["learning_eligibility"],
+                        row["status"],
+                    )
+        finally:
+            connection.rollback()
+    return result
+
+
 def acknowledge_task_evidence(
     rows: Iterable[dict], *, db_path: Path | None = None,
 ) -> int:
